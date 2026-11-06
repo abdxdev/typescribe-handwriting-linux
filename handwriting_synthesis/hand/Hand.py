@@ -37,7 +37,7 @@ class Hand(object):
         )
         self.nn.restore()
 
-    def write(self, filename, lines, biases=None, styles=None, stroke_colors=None, stroke_widths=None, page=None):
+    def write(self, filename, lines, biases=None, styles=None, stroke_colors=None, stroke_widths=None, page=None, pressure=0.0):
         valid_char_set = set(drawing.alphabet)
         
         for line_num, line in enumerate(lines):
@@ -60,7 +60,8 @@ class Hand(object):
 
         strokes = self._sample(lines, biases=biases, styles=styles)
         lines = ['' if line == '.' else line for line in lines]
-        _draw(strokes, lines, filename, stroke_colors=stroke_colors, stroke_widths=stroke_widths, page=page)
+        _draw(strokes, lines, filename, stroke_colors=stroke_colors, stroke_widths=stroke_widths, page=page,
+              pressure=pressure)
 
     def _sample(self, lines, biases=None, styles=None):
         num_samples = len(lines)

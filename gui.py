@@ -33,8 +33,14 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
+try:  # librsvg lets the PDF export stay vector; without it pages are embedded as images
+    gi.require_version("Rsvg", "2.0")
+    from gi.repository import Rsvg  # noqa: E402
+except (ValueError, ImportError):
+    Rsvg = None
+
 import cairo  # noqa: E402  (pycairo ships with PyGObject)
-from generate import layout_pages  # noqa: E402
+from generate import layout_pages, unsupported_chars  # noqa: E402
 
 APP_ID = "io.github.typescribe.TypeScribe"
 APP_DIR = Path(__file__).resolve().parent
@@ -50,6 +56,9 @@ DEFAULTS = {
     "bias": 0.95,
     "pen_width": 1.0,
     "ink_color": "#000000",
+    "ink_color2": "#1c4fd8",
+    "ink_mode": 0,
+    "pressure": 0.0,
     "paper": "A4",
     "ppi": 72,
     "ppi_custom": 200,
@@ -69,6 +78,9 @@ CSS = """
 .page-preview { border-radius: 12px; }
 .result-paper { background: #f2f2f2; }
 """
+
+DEFAULT_BASE_NAME = "handwriting"
+INK_MODES = ["Single color", "Alternate lines", "Random per line"]
 
 # Generated pages are rendered here first; "Export" copies them to the chosen folder.
 PREVIEW_DIR = Path(GLib.get_user_cache_dir()) / "typescribe" / "preview"
@@ -111,27 +123,39 @@ def set_source(cr, value):
     cr.set_source_rgba(color.red, color.green, color.blue, color.alpha)
 
 
-def svg_page_size(svg_path, fallback):
-    """Page size in points: the SVG viewBox is in 72-ppi units, i.e. points."""
+def svg_page_size(svg_path):
+    """Page size in points (the SVG viewBox is in 72-ppi units), or None."""
     head = Path(svg_path).read_text(errors="replace")[:2000]
     match = re.search(r'viewBox="\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"', head)
-    return (float(match.group(1)), float(match.group(2))) if match else fallback
+    return (float(match.group(1)), float(match.group(2))) if match else None
 
 
 def write_pdf(svg_pages, pdf_path):
-    """Combine the rendered page images into one multi-page PDF, one page each."""
+    """Combine the pages into one multi-page PDF.
+
+    With librsvg the strokes stay vector (sharp at any zoom, independent of the
+    chosen ppi); otherwise the rendered PNG of each page is embedded instead.
+    """
     pdf = None
     try:
         for svg in svg_pages:
-            image = cairo.ImageSurface.create_from_png(f"{svg}.png")
-            width, height = svg_page_size(svg, (image.get_width(), image.get_height()))
+            size, image = svg_page_size(svg), None
+            if Rsvg is None or size is None:
+                image = cairo.ImageSurface.create_from_png(f"{svg}.png")
+                size = size or (image.get_width(), image.get_height())
+            width, height = size
             if pdf is None:
                 pdf = cairo.PDFSurface(str(pdf_path), width, height)
             pdf.set_size(width, height)
             cr = cairo.Context(pdf)
-            cr.scale(width / image.get_width(), height / image.get_height())
-            cr.set_source_surface(image, 0, 0)
-            cr.paint()
+            if image is None:
+                viewport = Rsvg.Rectangle()
+                viewport.x, viewport.y, viewport.width, viewport.height = 0, 0, width, height
+                Rsvg.Handle.new_from_file(str(svg)).render_document(cr, viewport)
+            else:
+                cr.scale(width / image.get_width(), height / image.get_height())
+                cr.set_source_surface(image, 0, 0)
+                cr.paint()
             pdf.show_page()
     finally:
         if pdf is not None:
@@ -393,8 +417,14 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.colors = {}
         self._updating = False  # suppress change handlers during programmatic updates
         self._ppi = DEFAULTS["ppi"]
-        self.proc = None
-        self.run = None
+        self._loading = True   # no settings writes until startup is done
+        self._save_id = 0
+        self.worker = None     # long-lived generator process (keeps the model loaded)
+        self.worker_stdin = None
+        self.run = None        # the job currently being generated, if any
+        self.last_job = None   # the job behind the pages on screen (for regenerating a page)
+        self.progress_fraction = None  # None = indeterminate
+        self.log_path = Path(GLib.get_user_cache_dir()) / "typescribe" / "last-run.log"
         self.pulse_id = 0
         self.settings = load_settings()
         remembered_dir = self.settings.get("output_dir")
@@ -406,7 +436,10 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self._build_content()
         self._build_shell()
         self._install_actions()
+        self._apply_ui_settings(self.settings.get("ui"))
         self._on_style_changed()
+        self.connect("close-request", self._on_close)
+        self._loading = False
         self._refresh()
 
     # ---- construction ----------------------------------------------------- #
@@ -456,6 +489,15 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         hand.add(self._spin_row("bias", "Consistency", "Higher is neater, lower is looser", 0.0, 2.0, 0.05, 2))
         hand.add(self._spin_row("pen_width", "Pen thickness", None, 0.1, 10.0, 0.1, 1))
         hand.add(self._color_row("ink_color", "Ink color"))
+        self.ink_mode_row = Adw.ComboRow(
+            title="Ink mix", subtitle="Write with a second color too", model=Gtk.StringList.new(INK_MODES),
+        )
+        self.ink_mode_row.connect("notify::selected", self._on_ink_mode_changed)
+        hand.add(self.ink_mode_row)
+        self.ink2_row = self._color_row("ink_color2", "Second ink color")
+        self.ink2_row.set_visible(False)
+        hand.add(self.ink2_row)
+        hand.add(self._spin_row("pressure", "Pen pressure", "Variation in line weight", 0.0, 1.0, 0.05, 2))
         self.prefs.add(hand)
 
         page = Adw.PreferencesGroup(title="Page")
@@ -554,12 +596,16 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.page_label.add_css_class("dim-label")
         open_btn = Gtk.Button(label="Open Folder", icon_name="folder-open-symbolic")
         open_btn.connect("clicked", self._on_open_folder)
+        self.regen_btn = Gtk.Button(label="Regenerate Page", icon_name="view-refresh-symbolic",
+                                    tooltip_text="Write this page again")
+        self.regen_btn.connect("clicked", self._on_regenerate)
 
         nav = Gtk.Box(spacing=8, margin_bottom=10, margin_start=12, margin_end=12, halign=Gtk.Align.CENTER)
         nav.append(self.prev_btn)
         nav.append(self.page_label)
         nav.append(self.next_btn)
         nav.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL, margin_start=6, margin_end=6))
+        nav.append(self.regen_btn)
         nav.append(open_btn)
 
         # Light backdrop so ink stays visible on transparent exports in dark mode.
@@ -619,32 +665,40 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         choose_btn = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
         choose_btn.connect("clicked", lambda *_: (export_popover.popdown(), self._export_as()))
         self.folder_row.add_suffix(choose_btn)
+        self.name_row = Adw.EntryRow(title="File name")
+        self.name_row.set_text(DEFAULT_BASE_NAME)
+        self.name_row.connect("changed", self._queue_save)
 
         def format_row(title, subtitle, active):
             check = Gtk.CheckButton(active=active, valign=Gtk.Align.CENTER)
+            check.connect("toggled", self._queue_save)
             row = Adw.ActionRow(title=title, subtitle=subtitle, activatable_widget=check)
             row.add_prefix(check)
             return row, check
 
         svg_row, self.svg_check = format_row("SVG", "Vector, one file per page", True)
         png_row, self.png_check = format_row("PNG", "Image, one file per page", True)
-        pdf_row, self.pdf_check = format_row("PDF", "A single file with all pages", False)
+        pdf_row, self.pdf_check = format_row("PDF", "Vector, one file with all pages", False)
 
-        export_now = Gtk.Button(label="Export")
-        export_now.add_css_class("suggested-action")
-        export_now.add_css_class("pill")
-        export_now.connect("clicked", lambda *_: (export_popover.popdown(), self._on_export()))
+        self.export_now = Gtk.Button(label="Export")
+        self.export_now.add_css_class("suggested-action")
+        self.export_now.add_css_class("pill")
+        self.export_now.connect("clicked", lambda *_: (export_popover.popdown(), self._on_export()))
+        self.export_hint = Gtk.Label(label="Generate some pages first, then export them here.",
+                                     wrap=True, xalign=0.5)
+        self.export_hint.add_css_class("dim-label")
 
         for widget in (
-            section("Save to"), boxed_list(self.folder_row),
+            section("Save to"), boxed_list(self.folder_row, self.name_row),
             section("Formats"), boxed_list(svg_row, png_row, pdf_row),
-            export_now,
+            self.export_now, self.export_hint,
         ):
             export_box.append(widget)
         export_popover.set_child(export_box)
 
+        # The popover is usable before anything is generated; only exporting waits.
         self.export_btn = Adw.SplitButton(label="Export", popover=export_popover)
-        self.export_btn.set_action_name("win.export")
+        self.export_btn.connect("clicked", self._on_export_clicked)
         self._update_folder_label()
 
         header = Adw.HeaderBar()
@@ -687,6 +741,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             ("generate", self._on_generate_action),
             ("export", self._on_export),
             ("export-as", self._export_as),
+            ("open-folder", self._on_open_folder),
             ("reset", self._on_reset),
             ("open-text", self._on_open_text),
             ("about", self._on_about),
@@ -702,11 +757,24 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
     def _update_save_state(self):
         # "generate" stays enabled while running: the same action cancels the job.
-        can_export = bool(self.result_pages) and self.proc is None
+        can_export = bool(self.result_pages) and self.run is None
         for name in ("export", "export-as"):
             action = self.lookup_action(name)
             if action:
                 action.set_enabled(can_export)
+        self.export_now.set_sensitive(can_export)
+        self.export_hint.set_visible(not can_export)
+        self.regen_btn.set_sensitive(can_export and self.last_job is not None)
+
+    def _on_export_clicked(self, *_):
+        if self.result_pages and self.run is None:
+            self._on_export()
+        else:  # nothing to export yet: let the user set folder and formats up front
+            self.export_btn.get_popover().popup()
+
+    def _base_name(self):
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", self.name_row.get_text().strip()).strip(". ")
+        return name or DEFAULT_BASE_NAME
 
     def _export_as(self, *_):
         dialog = Gtk.FileDialog(title="Choose Output Folder")
@@ -715,6 +783,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         dialog.select_folder(self, None, self._on_folder_chosen)
 
     def _on_export(self, *_):
+        if not self.result_pages or self.run:
+            return
         if self.output_dir:
             self._export_results()
         else:
@@ -739,6 +809,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             "margin_left": int(s["margin_left"].get_value()),
             "margin_top": int(s["margin_top"].get_value()),
             "style": self.style_row.get_selected() + 1,
+            "ink_mode": self.ink_mode_row.get_selected(),
+            "pressure": s["pressure"].get_value(),
             "background": self.background_row.get_active(),
             "ppi": self.current_ppi(),
         }
@@ -836,6 +908,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
     def _refresh(self, *_):
         if not hasattr(self, "preview"):
             return
+        self._queue_save()
         self.preview.queue_draw()
         ppi = self.current_ppi()
         mm = lambda key: self.spins[key].get_value() / ppi * 25.4  # noqa: E731
@@ -843,7 +916,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         for key in DIM_KEYS:  # every px value also shows its size in inches
             px = self.spins[key].get_value()
             self.spins[key].set_subtitle(f"px  ({px / ppi:.2f} in)")
-        if self.proc:
+        if self.run:
             return
 
         v = self.values()
@@ -853,6 +926,11 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             pages = layout_pages(text, v["line_length"], v["lines_per_page"])
             lines = sum(len(p) for p in pages)
             parts.append(f"{len(pages)} page{'s' if len(pages) != 1 else ''} · {lines} lines")
+            skipped = unsupported_chars(text)
+            if skipped:
+                shown = " ".join(dict.fromkeys(skipped[:40]).keys())[:20].strip()
+                parts.append(f"⚠ {len(skipped)} unsupported character{'s' if len(skipped) != 1 else ''} "
+                             f"will be skipped ({shown})")
         if v["total_lines"] < v["lines_per_page"]:
             parts.append("Ruled lines per page is fewer than lines written")
         if lines_overflow(v):
@@ -874,6 +952,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         for key, button in self.colors.items():
             button.set_rgba(parse_rgba(DEFAULTS[key]))
         self.style_row.set_selected(DEFAULTS["style"] - 1)
+        self.ink_mode_row.set_selected(DEFAULTS["ink_mode"])
+        self.ink2_row.set_visible(False)
         self.background_row.set_active(DEFAULTS["background"])
         self.paper_row.set_selected(PAPER_NAMES.index(DEFAULTS["paper"]))
         self.orientation_row.set_selected(0)
@@ -883,9 +963,89 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self._updating = False
         self._refresh()
 
+    def _on_ink_mode_changed(self, *_):
+        self.ink2_row.set_visible(self.ink_mode_row.get_selected() != 0)
+        self._refresh()
+
+    # ---- remembered settings ---------------------------------------------------- #
+    def _collect_ui_settings(self):
+        return {
+            "spins": {key: row.get_value() for key, row in self.spins.items()},
+            "colors": {key: rgba_to_hex(button.get_rgba()) for key, button in self.colors.items()},
+            "style": self.style_row.get_selected(),
+            "ink_mode": self.ink_mode_row.get_selected(),
+            "background": self.background_row.get_active(),
+            "paper": self.paper_row.get_selected(),
+            "orientation": self.orientation_row.get_selected(),
+            "ppi": self.ppi_row.get_selected(),
+            "formats": {"svg": self.svg_check.get_active(), "png": self.png_check.get_active(),
+                        "pdf": self.pdf_check.get_active()},
+            "base_name": self.name_row.get_text(),
+        }
+
+    def _apply_ui_settings(self, data):
+        if not isinstance(data, dict):
+            return
+        self._loading = self._updating = True
+        try:
+            def number(value):
+                return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+            def select(row, value):
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < row.get_model().get_n_items():
+                    row.set_selected(value)
+
+            for key, value in (data.get("spins") or {}).items():
+                if key in self.spins and number(value):
+                    self.spins[key].set_value(value)
+            for key, value in (data.get("colors") or {}).items():
+                rgba = Gdk.RGBA()
+                if key in self.colors and isinstance(value, str) and rgba.parse(value):
+                    self.colors[key].set_rgba(rgba)
+            select(self.style_row, data.get("style"))
+            select(self.ink_mode_row, data.get("ink_mode"))
+            select(self.paper_row, data.get("paper"))
+            select(self.orientation_row, data.get("orientation"))
+            select(self.ppi_row, data.get("ppi"))
+            if isinstance(data.get("background"), bool):
+                self.background_row.set_active(data["background"])
+            formats = data.get("formats") if isinstance(data.get("formats"), dict) else {}
+            for key, check in (("svg", self.svg_check), ("png", self.png_check), ("pdf", self.pdf_check)):
+                if isinstance(formats.get(key), bool):
+                    check.set_active(formats[key])
+            if isinstance(data.get("base_name"), str):
+                self.name_row.set_text(data["base_name"])
+            self._ppi = self.current_ppi()
+            self.spins["ppi_custom"].set_visible(self.ppi_row.get_selected() == len(PPI_CHOICES))
+            self.ink2_row.set_visible(self.ink_mode_row.get_selected() != 0)
+        finally:
+            self._loading = self._updating = False
+
+    def _queue_save(self, *_):
+        if self._loading or self._save_id:
+            return
+        self._save_id = GLib.timeout_add(600, self._save_ui_settings)
+
+    def _save_ui_settings(self):
+        self._save_id = 0
+        self.settings["ui"] = self._collect_ui_settings()
+        save_settings(self.settings)
+        return False
+
+    def _on_close(self, *_):
+        if self._save_id:
+            GLib.source_remove(self._save_id)
+        self._save_ui_settings()
+        self._kill_worker()
+        return False
+
     # ---- dialogs ----------------------------------------------------------- #
-    def toast(self, message):
-        self.toasts.add_toast(Adw.Toast(title=message))
+    def toast(self, message, open_folder=False):
+        toast = Adw.Toast(title=message)
+        if open_folder:
+            toast.set_button_label("Open Folder")
+            toast.set_action_name("win.open-folder")
+        self.toasts.add_toast(toast)
 
     def alert(self, heading, body, details=None):
         dialog = Adw.AlertDialog(heading=heading, body=body)
@@ -933,9 +1093,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
     # ---- generation -------------------------------------------------------- #
     def _on_generate_action(self, *_):
-        if self.proc:
-            self.run["cancelled"] = True
-            self.proc.force_exit()
+        if self.run:  # the same action cancels a running job
+            self._cancel()
             return
 
         text = self.get_text()
@@ -952,17 +1111,35 @@ class TypeScribeWindow(Adw.ApplicationWindow):
                        "The ruled lines run past the bottom of the page. Increase the page height, "
                        "reduce the line height, or use fewer ruled lines.")
             return
-        python = find_model_python()
-        if not python:
-            self.alert(
-                "Model environment not found",
-                f"TypeScribe needs a Python environment with TensorFlow. Create it with\n"
-                f"conda env create -f environment.yml\n(environment name: {MODEL_ENV_NAME}), "
-                f"or point the TYPESCRIBE_PYTHON variable at its python executable.",
-            )
-            return
+        self._start(self._build_job(text, v))
 
-        self._start(text, v, python)
+    def _build_job(self, text, v):
+        to_units = 72 / v["ppi"]
+        return {
+            "text": text,
+            "output_dir": str(PREVIEW_DIR),
+            "max_line_length": v["line_length"],
+            "lines_per_page": v["lines_per_page"],
+            "bias": v["bias"],
+            "style": v["style"],
+            "ink_color": v["ink_color"],
+            "ink_color2": v["ink_color2"],
+            "ink_mode": v["ink_mode"],
+            "pressure": v["pressure"],
+            "pen_width": v["pen_width"],
+            # The model lays out in 72-ppi units; the export is scaled to the chosen ppi.
+            "page": [
+                v["line_height"] * to_units, v["total_lines"], v["view_height"] * to_units,
+                v["view_width"] * to_units, -v["margin_left"] * to_units, -v["margin_top"] * to_units,
+                v["page_color"], v["margin_color"], v["line_color"],
+                v["background"], v["ppi"] / 72,
+            ],
+        }
+
+    def _on_regenerate(self, *_):
+        if self.run or not self.result_pages or not self.last_job:
+            return
+        self._start(self.last_job, only_page=self.result_index + 1)
 
     def _on_folder_chosen(self, dialog, result):
         try:
@@ -975,56 +1152,70 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self._update_folder_label()
         self._export_results()
 
-    def _start(self, text, v, python):
-        PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-        for path in PREVIEW_DIR.iterdir():
-            if path.is_file():
-                path.unlink()
-
-        to_units = 72 / v["ppi"]
-        job = {
-            "text": text,
-            "output_dir": str(PREVIEW_DIR),
-            "max_line_length": v["line_length"],
-            "lines_per_page": v["lines_per_page"],
-            "bias": v["bias"],
-            "style": v["style"],
-            "ink_color": v["ink_color"],
-            "pen_width": v["pen_width"],
-            # The model lays out in 72-ppi units; the export is scaled to the chosen ppi.
-            "page": [
-                v["line_height"] * to_units, v["total_lines"], v["view_height"] * to_units,
-                v["view_width"] * to_units, -v["margin_left"] * to_units, -v["margin_top"] * to_units,
-                v["page_color"], v["margin_color"], v["line_color"],
-                v["background"], v["ppi"] / 72,
-            ],
-        }
-
-        log = Path(GLib.get_user_cache_dir()) / "typescribe" / "last-run.log"
-        log.parent.mkdir(parents=True, exist_ok=True)
+    def _ensure_worker(self):
+        """Start the generator once; it then stays up so the model is loaded only once."""
+        if self.worker:
+            return True
+        python = find_model_python()
+        if not python:
+            self.alert(
+                "Model environment not found",
+                f"TypeScribe needs a Python environment with TensorFlow. Create it with\n"
+                f"conda env create -f environment.yml\n(environment name: {MODEL_ENV_NAME}), "
+                f"or point the TYPESCRIBE_PYTHON variable at its python executable.",
+            )
+            return False
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
         launcher = Gio.SubprocessLauncher.new(
             Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE
         )
         launcher.set_cwd(str(APP_DIR))
-        launcher.set_stderr_file_path(str(log))
+        launcher.set_stderr_file_path(str(self.log_path))
         launcher.setenv("PYTHONUNBUFFERED", "1", True)
         launcher.setenv("TF_CPP_MIN_LOG_LEVEL", "2", True)
         try:
-            self.proc = launcher.spawnv([python, str(APP_DIR / "generate.py")])
+            worker = launcher.spawnv([python, str(APP_DIR / "generate.py")])
         except GLib.Error as err:
-            self.proc = None
             self.alert("Could not start the generator", err.message)
+            return False
+        self.worker = worker
+        self.worker_stdin = worker.get_stdin_pipe()
+        reader = Gio.DataInputStream.new(worker.get_stdout_pipe())
+        reader.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line, worker)
+        return True
+
+    def _kill_worker(self):
+        worker, self.worker = self.worker, None
+        if worker:
+            worker.force_exit()
+
+    def _start(self, job, only_page=None):
+        if not self._ensure_worker():
             return
+        if only_page is None:
+            PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+            for path in PREVIEW_DIR.iterdir():
+                if path.is_file():
+                    path.unlink()
+            message = job
+        else:  # write just this page again; the others stay as they are
+            message = {**job, "only_pages": [only_page]}
 
-        stdin = self.proc.get_stdin_pipe()
-        stdin.write_all(json.dumps(job).encode("utf-8"), None)
-        stdin.close(None)
-
-        self.run = {"files": [], "error": None, "cancelled": False, "log": log}
+        self.run = {"job": job, "only_page": only_page}
+        self.progress_fraction = None
         self._set_running(True)
         self.status.set_text("Starting…")
-        self.reader = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
-        self.reader.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line)
+        try:
+            self.worker_stdin.write_all((json.dumps(message) + "\n").encode("utf-8"), None)
+        except GLib.Error as err:
+            self._kill_worker()
+            self._finish_run(error=f"Could not talk to the generator: {err.message}")
+
+    def _cancel(self):
+        # Killing the worker is the only way to stop the model mid-page; the next
+        # Generate starts a fresh one (and reloads the model).
+        self._kill_worker()
+        self._finish_run(cancelled=True)
 
     def _set_running(self, running):
         self.sidebar_view.set_sensitive(not running)
@@ -1035,68 +1226,90 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         if running:
             self.generate_btn.remove_css_class("suggested-action")
             self.generate_btn.add_css_class("destructive-action")
-            self.pulse_id = GLib.timeout_add(120, self._pulse)
+            if not self.pulse_id:
+                self.pulse_id = GLib.timeout_add(120, self._pulse)
         else:
+            self.progress.set_fraction(0)
             self.generate_btn.remove_css_class("destructive-action")
             self.generate_btn.add_css_class("suggested-action")
 
     def _pulse(self):
-        if not self.proc:
+        if not self.run:
             self.pulse_id = 0
             return False
-        self.progress.pulse()
+        if self.progress_fraction is None:  # model loading / first page: no measurable progress yet
+            self.progress.pulse()
         return True
 
-    def _on_line(self, stream, result):
+    def _on_line(self, stream, result, worker):
         try:
             line, _length = stream.read_line_finish_utf8(result)
         except GLib.Error:
             line = None
-        if line is None:  # EOF: the worker has exited
-            self.proc.wait_async(None, self._on_exited)
+        if line is None:  # EOF: this worker has exited
+            worker.wait_async(None, self._on_worker_exited)
             return
 
-        try:
-            event = json.loads(line)
-        except ValueError:
-            event = {}
-        kind = event.get("event")
-        if kind == "loading":
-            self.status.set_text("Loading the handwriting model…")
-        elif kind == "page_start":
-            self.status.set_text(f"Writing page {event['n']} of {event['total']}…")
-        elif kind == "done":
-            self.run["files"] = event.get("files", [])
-        elif kind == "error":
-            self.run["error"] = event.get("message", "Unknown error")
-        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line)
+        if worker is self.worker and self.run:  # ignore anything from a worker we killed
+            try:
+                event = json.loads(line)
+            except ValueError:
+                event = {}
+            kind = event.get("event")
+            if kind == "loading":
+                self.progress_fraction = None
+                self.status.set_text("Loading the handwriting model…")
+            elif kind == "page_start":
+                self.status.set_text(f"Writing page {event.get('n')} of {event.get('total')}…")
+            elif kind == "page_done":
+                self.progress_fraction = event.get("index", 0) / max(1, event.get("count", 1))
+                self.progress.set_fraction(self.progress_fraction)
+            elif kind == "done":
+                self._finish_run(files=event.get("files", []))
+            elif kind == "error":
+                self._finish_run(error=event.get("message", "Unknown error"))
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line, worker)
 
-    def _on_exited(self, proc, result):
+    def _on_worker_exited(self, proc, result):
         try:
             proc.wait_finish(result)
         except GLib.Error:
             pass
-        run, status = self.run, proc.get_exit_status() if proc.get_if_exited() else -1
-        self.proc, self.run = None, None
+        if proc is not self.worker:  # one we killed on purpose
+            return
+        self.worker = None
+        if self.run:
+            self._finish_run(error="The generator exited unexpectedly.")
+
+    def _finish_run(self, files=None, error=None, cancelled=False):
+        run, self.run = self.run, None
         self._set_running(False)
         self._refresh()
 
-        if run["cancelled"]:
+        if cancelled:
             self.toast("Generation cancelled")
-        elif run["error"] or status != 0 or not run["files"]:
+        elif error or not files:
             tail = ""
             try:
-                tail = "\n".join(run["log"].read_text(errors="replace").splitlines()[-15:])
+                tail = "\n".join(self.log_path.read_text(errors="replace").splitlines()[-15:])
             except OSError:
                 pass
-            self.alert("Generation failed", run["error"] or "The generator exited unexpectedly.", tail or None)
+            self.alert("Generation failed", error or "The generator produced no pages.", tail or None)
         else:
-            self.result_pages = run["files"]
-            self._show_page(0)
+            if run["only_page"] is None:
+                self.result_pages = files
+                self.last_job = run["job"]
+                index = 0
+            else:
+                index = run["only_page"] - 1
+            self._show_page(index)
             self.view_stack.set_visible_child_name("result")
-            count = len(self.result_pages)
             self._update_save_state()
-            self.toast(f"Generated {count} page{'s' if count != 1 else ''}. Choose Export to export.")
+            count = len(self.result_pages)
+            if run["only_page"] is None:
+                self.toast(f"Generated {count} page{'s' if count != 1 else ''}. Choose Export to export.")
+            else:
+                self.toast(f"Page {run['only_page']} written again")
 
     def _export_results(self):
         if not self.output_dir or not self.result_pages:
@@ -1107,24 +1320,49 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         if not formats:
             self.toast("Select SVG, PNG or PDF before exporting")
             return
+
+        base, destination = self._base_name(), Path(self.output_dir)
+        targets = []  # (source file or None for the PDF, destination file)
+        for number, name in enumerate(self.result_pages, start=1):
+            source = Path(name)
+            if "svg" in formats:
+                targets.append((source, destination / f"{base}_page_{number}.svg"))
+            png = Path(f"{source}.png")
+            if "png" in formats and png.is_file():
+                targets.append((png, destination / f"{base}_page_{number}.png"))
+        if "pdf" in formats:
+            targets.append((None, destination / f"{base}.pdf"))
+
+        existing = [t for _src, t in targets if t.exists()]
+        if not existing:
+            self._write_targets(targets)
+            return
+        dialog = Adw.AlertDialog(
+            heading="Replace existing files?",
+            body=f"{len(existing)} file{'s' if len(existing) != 1 else ''} in {destination} "
+                 f"will be overwritten. Change the file name in the Export menu to keep both.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("replace", "Replace")
+        dialog.set_response_appearance("replace", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, response: response == "replace" and self._write_targets(targets))
+        dialog.present(self)
+
+    def _write_targets(self, targets):
         try:
-            destination = Path(self.output_dir)
-            destination.mkdir(parents=True, exist_ok=True)
-            for source_name in self.result_pages:
-                source = Path(source_name)
-                if "svg" in formats:
-                    shutil.copy2(source, destination / source.name)
-                if "png" in formats:
-                    png = Path(f"{source}.png")
-                    if png.is_file():
-                        shutil.copy2(png, destination / png.name)
-            if "pdf" in formats:
-                write_pdf(self.result_pages, destination / "handwriting.pdf")
-        except (OSError, cairo.Error) as err:
+            Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+            for source, target in targets:
+                if source is None:
+                    write_pdf(self.result_pages, target)
+                else:
+                    shutil.copy2(source, target)
+        except (OSError, cairo.Error, GLib.Error) as err:
             self.alert("Could not export pages", str(err))
             return
         count = len(self.result_pages)
-        self.toast(f"Exported {count} page{'s' if count != 1 else ''} to {self.output_dir}")
+        self.toast(f"Exported {count} page{'s' if count != 1 else ''} to {self.output_dir}", open_folder=True)
 
     # ---- results ----------------------------------------------------------- #
     def _show_page(self, index):
@@ -1135,6 +1373,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.result_index = index
         svg = self.result_pages[index]
         preview = svg + ".png" if os.path.exists(svg + ".png") else svg
+        self.picture.set_file(None)  # drop the cached image so a rewritten page reloads
         self.picture.set_file(Gio.File.new_for_path(preview))
         self.page_label.set_text(f"Page {index + 1} of {len(self.result_pages)}")
         self.prev_btn.set_sensitive(index > 0)

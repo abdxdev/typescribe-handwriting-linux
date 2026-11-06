@@ -4,7 +4,33 @@ import cairosvg
 
 from handwriting_synthesis import drawing
 
-def _draw(strokes, lines, filename, stroke_colors=None, stroke_widths=None, page = None):
+
+def _pressure_paths(strokes, color, width, pressure, chunk=5):
+    """Pen strokes drawn as short pieces whose width drifts like pen pressure."""
+    level = 0.0
+    pieces, current, prev_eos = [], [], 1.0
+    for x, y, eos in zip(*strokes.T):
+        if prev_eos == 1.0 and current:
+            pieces.append(current)
+            current = []
+        current.append((x, y))
+        prev_eos = eos
+    if current:
+        pieces.append(current)
+
+    for points in pieces:
+        for start in range(0, len(points) - 1, chunk - 1):
+            part = points[start:start + chunk]
+            if len(part) < 2:
+                continue
+            level = float(np.clip(level + np.random.normal(0.0, 0.35), -1.0, 1.0))
+            piece_width = max(width * 0.25, width * (1 + pressure * 0.7 * level))
+            d = "M{},{} ".format(*part[0]) + " ".join("L{},{}".format(x, y) for x, y in part[1:])
+            path = svgwrite.path.Path(d)
+            yield path.stroke(color=color, width=round(piece_width, 3), linecap='round').fill("none")
+
+
+def _draw(strokes, lines, filename, stroke_colors=None, stroke_widths=None, page=None, pressure=0.0):
     stroke_colors = stroke_colors or ['black'] * len(lines)
     stroke_widths = stroke_widths or [2] * len(lines)
 
@@ -60,15 +86,19 @@ def _draw(strokes, lines, filename, stroke_colors=None, stroke_widths=None, page
         strokes[:, 1] *= -1
         strokes[:, :2] -= strokes[:, :2].min() + initial_coord
 
-        # Create the path for handwriting strokes
-        prev_eos = 1.0
-        p = "M{},{} ".format(0, 0)
-        for x, y, eos in zip(*strokes.T):
-            p += '{}{},{} '.format('M' if prev_eos == 1.0 else 'L', x, y)
-            prev_eos = eos
-        path = svgwrite.path.Path(p)
-        path = path.stroke(color=color, width=width, linecap='round').fill("none")
-        dwg.add(path)
+        if pressure > 0:
+            for path in _pressure_paths(strokes, color, width, pressure):
+                dwg.add(path)
+        else:
+            # Create the path for handwriting strokes
+            prev_eos = 1.0
+            p = "M{},{} ".format(0, 0)
+            for x, y, eos in zip(*strokes.T):
+                p += '{}{},{} '.format('M' if prev_eos == 1.0 else 'L', x, y)
+                prev_eos = eos
+            path = svgwrite.path.Path(p)
+            path = path.stroke(color=color, width=width, linecap='round').fill("none")
+            dwg.add(path)
 
         initial_coord[1] -= line_height
 

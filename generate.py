@@ -11,6 +11,7 @@ This module has no GUI dependencies. It is used in two ways:
 
 import json
 import os
+import random
 import sys
 
 ALPHABET = [
@@ -22,6 +23,23 @@ ALPHABET = [
     "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x",
     "y", "z",
 ]
+
+
+def unsupported_chars(text, alphabet=ALPHABET):
+    """Characters in `text` the model cannot write (whitespace is fine)."""
+    return [c for c in text if c not in alphabet and not c.isspace()]
+
+
+def line_colors(job, count):
+    """Per-line ink colours for the chosen ink mix (single / alternate / random)."""
+    first = job["ink_color"]
+    second = job.get("ink_color2") or first
+    mode = job.get("ink_mode", 0)
+    if mode == 1:
+        return [first if i % 2 == 0 else second for i in range(count)]
+    if mode == 2:
+        return [random.choice((first, second)) for _ in range(count)]
+    return [first] * count
 
 
 def layout_pages(input_text, max_line_length, lines_per_page, alphabet=ALPHABET):
@@ -59,10 +77,12 @@ def layout_pages(input_text, max_line_length, lines_per_page, alphabet=ALPHABET)
     return [wrapped[i : i + lines_per_page] for i in range(0, len(wrapped), lines_per_page)]
 
 
-def process_text(job, progress=None):
-    """Generate handwriting SVG pages for `job` (a dict, see gui.py)."""
-    from handwriting_synthesis import Hand  # heavy import (TensorFlow)
+def process_text(job, progress=None, hand=None):
+    """Generate handwriting SVG pages for `job` (a dict, see gui.py).
 
+    `hand` is a loaded model to reuse; otherwise one is created. When the job has
+    `only_pages` (1-based numbers) just those pages are written again.
+    """
     def emit(**event):
         if progress:
             progress(event)
@@ -71,15 +91,21 @@ def process_text(job, progress=None):
     if not pages:
         raise ValueError("There is no text to write.")
 
+    if hand is None:
+        from handwriting_synthesis import Hand  # heavy import (TensorFlow)
+        emit(event="loading")
+        hand = Hand()
+
     output_dir = job["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
 
-    emit(event="loading")
-    hand = Hand()
+    wanted = job.get("only_pages") or range(1, len(pages) + 1)
+    wanted = [n for n in wanted if 1 <= n <= len(pages)]
 
     written = []
-    for n, page_lines in enumerate(pages, start=1):
-        emit(event="page_start", n=n, total=len(pages))
+    for n in wanted:
+        page_lines = pages[n - 1]
+        emit(event="page_start", n=n, total=len(pages), index=len(written), count=len(wanted))
         path = os.path.join(output_dir, f"result_page_{n}.svg")
         count = len(page_lines)
         hand.write(
@@ -87,16 +113,18 @@ def process_text(job, progress=None):
             lines=page_lines,
             biases=[job["bias"]] * count,
             styles=[job["style"]] * count,
-            stroke_colors=[job["ink_color"]] * count,
+            stroke_colors=line_colors(job, count),
             stroke_widths=[job["pen_width"]] * count,
             page=job["page"],
+            pressure=job.get("pressure", 0.0),
         )
         written.append(path)
-        emit(event="page_done", n=n, total=len(pages), path=path)
+        emit(event="page_done", n=n, total=len(pages), index=len(written), count=len(wanted), path=path)
     return written
 
 
 def _worker():
+    """Serve one JSON job per stdin line, keeping the model loaded between jobs."""
     # The model loads its weights from paths relative to the project root.
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, os.getcwd())
@@ -109,13 +137,20 @@ def _worker():
         protocol.write(json.dumps(event) + "\n")
         protocol.flush()
 
-    try:
-        job = json.load(sys.stdin)
-        files = process_text(job, progress=send)
-        send({"event": "done", "files": files})
-    except Exception as exc:  # reported to the GUI, which shows it in a dialog
-        send({"event": "error", "message": f"{type(exc).__name__}: {exc}"})
-        sys.exit(1)
+    hand = None
+    for raw in sys.stdin:
+        if not raw.strip():
+            continue
+        try:
+            job = json.loads(raw)
+            if hand is None:
+                from handwriting_synthesis import Hand  # heavy import (TensorFlow)
+                send({"event": "loading"})
+                hand = Hand()
+            files = process_text(job, progress=send, hand=hand)
+            send({"event": "done", "files": files})
+        except Exception as exc:  # reported to the GUI, which shows it in a dialog
+            send({"event": "error", "message": f"{type(exc).__name__}: {exc}"})
 
 
 if __name__ == "__main__":
