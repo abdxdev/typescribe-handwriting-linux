@@ -1,0 +1,122 @@
+"""
+TypeScribe generation backend.
+
+This module has no GUI dependencies. It is used in two ways:
+
+* imported for `process_text` / `ALPHABET`
+* run as a worker process (`python generate.py < job.json`) by the GTK GUI,
+  inside the conda environment that has TensorFlow installed. Progress is
+  reported as one JSON object per line on stdout.
+"""
+
+import json
+import os
+import sys
+
+ALPHABET = [
+    "\x00", " ", "!", '"', "#", "'", "(", ")", ",", "-", ".",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", ";",
+    "?", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K",
+    "L", "M", "N", "O", "P", "R", "S", "T", "U", "V", "W", "Y",
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
+    "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x",
+    "y", "z",
+]
+
+
+def layout_pages(input_text, max_line_length, lines_per_page, alphabet=ALPHABET):
+    """Sanitize, wrap and paginate text. Returns a list of pages (lists of lines).
+
+    Empty lines are kept as "." which the synthesizer draws as a blank line.
+    """
+    lines = [line.strip() if line.strip() else "." for line in input_text.split("\n")]
+    sanitized = ["".join(c if c in alphabet else " " for c in line) for line in lines]
+
+    # The model rejects lines over 75 characters, so words longer than the
+    # limit (URLs, unbroken strings) are split into chunks.
+    limit = max(1, min(max_line_length, 75))
+
+    def words_of(line):
+        for word in line.split():
+            while len(word) > limit:
+                yield word[:limit]
+                word = word[limit:]
+            yield word
+
+    wrapped = []
+    for line in sanitized:
+        current = ""
+        for word in words_of(line):
+            if len(current) + len(word) + 1 > max_line_length:
+                if current.strip():
+                    wrapped.append(current.strip())
+                current = word
+            else:
+                current += " " + word
+        if current:
+            wrapped.append(current.strip())
+
+    return [wrapped[i : i + lines_per_page] for i in range(0, len(wrapped), lines_per_page)]
+
+
+def process_text(job, progress=None):
+    """Generate handwriting SVG pages for `job` (a dict, see gui.py)."""
+    from handwriting_synthesis import Hand  # heavy import (TensorFlow)
+
+    def emit(**event):
+        if progress:
+            progress(event)
+
+    pages = layout_pages(job["text"], job["max_line_length"], job["lines_per_page"])
+    if not pages:
+        raise ValueError("There is no text to write.")
+
+    output_dir = job["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+
+    emit(event="loading")
+    hand = Hand()
+
+    written = []
+    for n, page_lines in enumerate(pages, start=1):
+        emit(event="page_start", n=n, total=len(pages))
+        path = os.path.join(output_dir, f"result_page_{n}.svg")
+        count = len(page_lines)
+        hand.write(
+            filename=path,
+            lines=page_lines,
+            biases=[job["bias"]] * count,
+            styles=[job["style"]] * count,
+            stroke_colors=[job["ink_color"]] * count,
+            stroke_widths=[job["pen_width"]] * count,
+            page=job["page"],
+        )
+        written.append(path)
+        emit(event="page_done", n=n, total=len(pages), path=path)
+    return written
+
+
+def _worker():
+    # The model loads its weights from paths relative to the project root.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.getcwd())
+
+    # TensorFlow and friends print to stdout; keep stdout clean for our protocol.
+    protocol = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+    sys.stdout = sys.stderr
+
+    def send(event):
+        protocol.write(json.dumps(event) + "\n")
+        protocol.flush()
+
+    try:
+        job = json.load(sys.stdin)
+        files = process_text(job, progress=send)
+        send({"event": "done", "files": files})
+    except Exception as exc:  # reported to the GUI, which shows it in a dialog
+        send({"event": "error", "message": f"{type(exc).__name__}: {exc}"})
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    _worker()

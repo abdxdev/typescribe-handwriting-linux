@@ -41,21 +41,30 @@ There are two ways to get things rolling:
    - Clone this repo using ```git clone https://github.com/rudyoactiv/typescribe-handwriting.git```
    - Navigate to the cloned directory.
    - With Anaconda installed, run ```conda env create -f environment.yml``` to create an environment.
-   - Run ```conda activate test_hand``` to activate your environment.
-   - Run the program with ```python gui.py```
+   - Install the native GUI dependencies from your distro (GTK 4 + libadwaita + PyGObject), e.g.
+     `sudo pacman -S python-gobject gtk4 libadwaita` (Arch), `sudo dnf install python3-gobject gtk4 libadwaita` (Fedora)
+     or `sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1` (Debian/Ubuntu).
+   - Launch the app with ```./gui.py``` (it automatically uses the system Python for the GUI and the `test_hand`
+     conda environment for the model; set `TYPESCRIBE_PYTHON` to use a different interpreter for the model).
+   - Optional: run ```./install-desktop.sh``` to add **TypeScribe** to your app launcher.
+
+   The interface is a native GTK 4 / libadwaita app (GNOME style, adapts to light/dark mode). Generation runs in a
+   background process, so the window stays responsive.
 
 
 ### Usage
-1. Launch the application with the command ```python gui.py``` or double click TypeScribe.exe.
+1. Launch the application with the command ```./gui.py``` (or from your app launcher after `install-desktop.sh`), or double click TypeScribe.exe on Windows.
 2. Enter your text and adjust settings via the interface.
 3. Preview the layout and handwriting style.
 4. Click **Generate**.
-5. Select a destination folder for your files.
-6. Wait while it generates your output. May take a minute.
+5. Wait while it generates your preview. May take a minute.
+6. Click **Export** to export the generated pages. Select SVG and/or PNG in the
+   export menu. Use **Export As** (`Ctrl+Shift+E`) to choose a destination;
+   TypeScribe remembers that folder for later. `Ctrl+E` exports to the remembered
+   folder.
 
 ### Known Issues
 - Antivirus programs may flag (and even delete) the executable. This is due to the way Python programs are built and handled by Windows and cannot possibly be fixed. However, there is no cause for concern.
-- The application itself may freeze while your file is being generated. No need to panic, it does not crash.
 
 ### Future Plans
 - A more responsive design

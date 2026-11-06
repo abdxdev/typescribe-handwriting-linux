@@ -8,25 +8,37 @@ def _draw(strokes, lines, filename, stroke_colors=None, stroke_widths=None, page
     stroke_colors = stroke_colors or ['black'] * len(lines)
     stroke_widths = stroke_widths or [2] * len(lines)
 
-    line_height, total_lines_per_page, view_height, view_width, margin_left, margin_top, page_color, margin_color, line_color = page or [32, 24, 896, 632, -64, -96, "fff", "f00", "888"]
+    page = page or [32, 24, 896, 632, -64, -96, "#fff", "#f00", "#888"]
+    line_height, total_lines_per_page, view_height, view_width, margin_left, margin_top, page_color, margin_color, line_color = page[:9]
+    # Optional 10th entry: draw the page background (color, ruled lines, margins).
+    include_background = page[9] if len(page) > 9 else True
 
+
+    # Optional 11th entry: export scale (ppi / 72). The layout stays in 72-ppi
+    # units (the viewBox); the SVG/PNG are written at the scaled pixel size.
+    export_scale = page[10] if len(page) > 10 else None
 
     # Initialize the SVG drawing
-    dwg = svgwrite.Drawing(filename=filename)
+    if export_scale:
+        size = (f"{view_width * export_scale:.2f}px", f"{view_height * export_scale:.2f}px")
+        dwg = svgwrite.Drawing(filename=filename, size=size)
+    else:
+        dwg = svgwrite.Drawing(filename=filename)
     dwg.viewbox(width=view_width, height=view_height)
-    dwg.add(dwg.rect(insert=(0, 0), size=(view_width, view_height), fill=page_color))
 
+    if include_background:
+        dwg.add(dwg.rect(insert=(0, 0), size=(view_width, view_height), fill=page_color))
 
-    # Draw fixed number of ruled lines
-    for i in range(total_lines_per_page):
-        y_position = line_height * (i + 1) - margin_top # Adjust as needed to align with text
-        dwg.add(dwg.line(start=(0, y_position), end=(view_width, y_position), stroke=line_color, stroke_width=1))
+        # Draw fixed number of ruled lines
+        for i in range(total_lines_per_page):
+            y_position = line_height * (i + 1) - margin_top # Adjust as needed to align with text
+            dwg.add(dwg.line(start=(0, y_position), end=(view_width, y_position), stroke=line_color, stroke_width=1))
 
-    dwg.add(dwg.line(start=(-margin_left + line_height/2, 0), end=(-margin_left + line_height/2, view_height), stroke=margin_color, stroke_width=1))
-    dwg.add(dwg.line(start=(-margin_left + line_height/2 - 5, 0), end=(-margin_left + line_height/2 - 5, view_height), stroke=margin_color, stroke_width=1))
+        dwg.add(dwg.line(start=(-margin_left + line_height/2, 0), end=(-margin_left + line_height/2, view_height), stroke=margin_color, stroke_width=1))
+        dwg.add(dwg.line(start=(-margin_left + line_height/2 - 5, 0), end=(-margin_left + line_height/2 - 5, view_height), stroke=margin_color, stroke_width=1))
 
-    dwg.add(dwg.line(start=(0, -margin_top), end=(view_width, -margin_top), stroke=margin_color, stroke_width=1))
-    dwg.add(dwg.line(start=(0, -margin_top - 5), end=(view_width, -margin_top - 5), stroke=margin_color, stroke_width=1))
+        dwg.add(dwg.line(start=(0, -margin_top), end=(view_width, -margin_top), stroke=margin_color, stroke_width=1))
+        dwg.add(dwg.line(start=(0, -margin_top - 5), end=(view_width, -margin_top - 5), stroke=margin_color, stroke_width=1))
 
 
     initial_coord = np.array([margin_left, margin_top - line_height/2])
@@ -42,7 +54,6 @@ def _draw(strokes, lines, filename, stroke_colors=None, stroke_widths=None, page
             continue
 
         # Convert offsets to coordinates and adjust them
-        offsets[:, :2] *= 1
         strokes = drawing.offsets_to_coords(offsets)
         strokes = drawing.denoise(strokes)
         strokes[:, :2] = drawing.align(strokes[:, :2])
