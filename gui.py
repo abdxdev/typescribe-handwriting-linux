@@ -88,6 +88,7 @@ DEFAULTS = {
     "line_length": 60,
     "lines_per_page": 24,
     "total_lines": 24,
+    "start_line": 0,  # ruled lines left empty at the top before the text begins
     "style": 1,
     "bias": 0.95,
     "pen_width": 1.0,
@@ -356,16 +357,22 @@ def layout_drag_changes(handle, s, dx, dy):
     width, height = s["view_width"], s["view_height"]
     left, top, line = s["margin_left"], s["margin_top"], s["line_height"]
     lines0, written0, chars0 = s["total_lines"], s["lines_per_page"], s["line_length"]
+    first0 = s["start_line"]            # empty ruled lines above the text
+    end0 = first0 + written0            # ruled line the text ends at (exclusive)
 
     # Knobs that change one text setting only.
     if handle == "total_lines":
-        lines = max(1, min(fit_lines(height, top, line), round(lines0 + dy / line)))
+        lines = max(first0 + 1, min(fit_lines(height, top, line), round(lines0 + dy / line)))
         return {
             "total_lines": lines,
-            "lines_per_page": lines if written0 == lines0 else min(written0, lines),
+            "lines_per_page": lines - first0 if end0 == lines0 else min(written0, lines - first0),
         }
+    if handle == "start_line":
+        # The start moves, the end of the text stays where it is.
+        first = max(0, min(end0 - 1, round(first0 + dy / line)))
+        return {"start_line": first, "lines_per_page": end0 - first}
     if handle == "lines_per_page":
-        return {"lines_per_page": max(1, min(lines0, round(written0 + dy / line)))}
+        return {"lines_per_page": max(1, min(lines0 - first0, round(written0 + dy / line)))}
     if handle == "line_length":
         per_char = CHAR_WIDTH_UNITS * ppi / 72
         most = max(20, fit_chars(width, left, ppi))
@@ -390,7 +397,8 @@ def layout_drag_changes(handle, s, dx, dy):
     was_full = lines0 == fit_lines(height, top, line)
     fits = fit_lines(new_h, new_top, new_line)
     lines = fits if was_full else min(lines0, fits)
-    written = lines if written0 == lines0 else min(written0, lines)
+    first = min(first0, lines - 1)
+    written = lines - first if end0 == lines0 else max(1, min(written0, lines - first))
 
     chars_followed = chars0 == fit_chars(width, left, ppi)
     chars_fit = fit_chars(new_w, new_left, ppi)
@@ -399,7 +407,7 @@ def layout_drag_changes(handle, s, dx, dy):
     return {
         "view_width": new_w, "view_height": new_h,
         "margin_left": new_left, "margin_top": new_top, "line_height": new_line,
-        "total_lines": lines, "lines_per_page": written, "line_length": chars,
+        "total_lines": lines, "start_line": first, "lines_per_page": written, "line_length": chars,
     }
 
 
@@ -434,6 +442,7 @@ class PagePreview(Gtk.DrawingArea):
       red left-margin line                left margin
       knob on the first ruled line        line height
       knob on the last ruled line         ruled lines per page
+      knob on the first written line      where the text starts (lines left empty above it)
       knob on the last written line       lines written per page
       knob in the header band             characters per line (approximate)
     """
@@ -447,7 +456,7 @@ class PagePreview(Gtk.DrawingArea):
         "width": "ew-resize", "height": "ns-resize", "size": "nwse-resize",
         "margin_left": "ew-resize", "margin_top": "ns-resize",
         "line_height": "ns-resize", "total_lines": "ns-resize",
-        "lines_per_page": "ns-resize", "line_length": "ew-resize",
+        "start_line": "ns-resize", "lines_per_page": "ns-resize", "line_length": "ew-resize",
     }
     TIPS = {
         "width": "Drag to change the page width",
@@ -457,7 +466,8 @@ class PagePreview(Gtk.DrawingArea):
         "margin_top": "Drag to move the top margin",
         "line_height": "Drag up or down to change the line height",
         "total_lines": "Drag to change the number of ruled lines",
-        "lines_per_page": "Drag to change how many lines are written",
+        "start_line": "Drag to change where the text starts",
+        "lines_per_page": "Drag to change where the text ends",
         "line_length": "Drag to change the characters per line (approximate)",
     }
 
@@ -514,10 +524,12 @@ class PagePreview(Gtk.DrawingArea):
             return min(max(y, oy + 8), oy + ph - 8)
 
         wrap_x = min(ox + (ml + v["line_length"] * per_char) * scale, ox + pw - 10)
+        first, last = v["start_line"], v["start_line"] + v["lines_per_page"]
         return {
             "line_height": (ox + pw / 2, on_page(oy + (mt + lh) * scale)),
             "total_lines": (ox + pw - 22, on_page(oy + (mt + lh * v["total_lines"]) * scale)),
-            "lines_per_page": (ox + 22, on_page(oy + (mt + lh * v["lines_per_page"]) * scale)),
+            "start_line": (ox + 22, on_page(oy + (mt + lh * first) * scale)),
+            "lines_per_page": (ox + 22, on_page(oy + (mt + lh * last) * scale)),
             "line_length": (wrap_x, oy + min(max(12.0, mt * scale / 2), ph - 12)),
         }
 
@@ -546,8 +558,10 @@ class PagePreview(Gtk.DrawingArea):
             segments.append(row(1))
         if name == "total_lines":
             segments.append(row(v["total_lines"]))
+        if name == "start_line":
+            segments.append(row(v["start_line"]))
         if name == "lines_per_page":
-            segments.append(row(v["lines_per_page"]))
+            segments.append(row(v["start_line"] + v["lines_per_page"]))
         if name == "line_length":
             x = min(ox + (ml + v["line_length"] * per_char) * scale, ox + pw - 10)
             segments.append((x, oy, x, oy + ph))
@@ -712,7 +726,7 @@ class PagePreview(Gtk.DrawingArea):
         if focus:
             cr.set_source_rgba(ar, ag, ab, 0.95)
             cr.set_line_width(2.0)
-            if focus in ("line_height", "total_lines", "lines_per_page", "line_length"):
+            if focus in ("line_height", "total_lines", "start_line", "lines_per_page", "line_length"):
                 cr.set_dash([6, 4])
             for x1, y1, x2, y2 in self._guides(focus, v, scale, ox, oy):
                 cr.move_to(x1, y1)
@@ -750,6 +764,7 @@ class PagePreview(Gtk.DrawingArea):
             "margin_top": f"Top margin {v['margin_top']:g} px",
             "line_height": f"Line height {v['line_height']:g} px",
             "total_lines": f"{v['total_lines']} ruled lines",
+            "start_line": f"Text starts on line {v['start_line'] + 1}",
             "lines_per_page": f"{v['lines_per_page']} lines written",
             "line_length": f"{v['line_length']} characters per line",
         }
@@ -1315,6 +1330,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         # Text on the page: how the text is wrapped onto the ruling.
         text = Adw.PreferencesGroup(title="Text on the page")
         text.add(self._spin_row("line_length", "Characters per line", "Wrap limit", 20, 75, 1, 0))
+        text.add(self._spin_row("start_line", "Text starts after", "Empty ruled lines at the top", 0, 199, 1, 0))
         text.add(self._spin_row("lines_per_page", "Lines written per page", "Up to the ruled lines", 1, 200, 1, 0))
         fit_row = Adw.ActionRow(
             title="Fit to page", subtitle="Fill the page with ruled lines and set the wrap limit",
@@ -1325,8 +1341,9 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         fit_row.set_activatable_widget(fit_btn)
         text.add(fit_row)
         page.add(text)
-        # You can never write more lines than are ruled.
+        # The text must fit between its first line and the last ruled line.
         self.spins["total_lines"].connect("notify::value", self._sync_line_limits)
+        self.spins["start_line"].connect("notify::value", self._sync_line_limits)
 
         colors = Adw.PreferencesGroup(title="Colors")
         colors.add(self._color_row("page_color", "Page color"))
@@ -1595,6 +1612,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             "line_length": int(s["line_length"].get_value()),
             "lines_per_page": int(s["lines_per_page"].get_value()),
             "total_lines": int(s["total_lines"].get_value()),
+            "start_line": int(s["start_line"].get_value()),
             "bias": s["bias"].get_value(),
             "pen_width": s["pen_width"].get_value(),
             "line_height": float(s["line_height"].get_value()),
@@ -1643,7 +1661,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         s = self.spins
         fit = fit_lines(s["view_height"].get_value(), s["margin_top"].get_value(), s["line_height"].get_value())
         s["total_lines"].set_value(fit)
-        s["lines_per_page"].set_value(fit)
+        s["start_line"].set_value(min(int(s["start_line"].get_value()), fit - 1))
+        s["lines_per_page"].set_value(max(1, fit - int(s["start_line"].get_value())))
         s["line_length"].set_value(
             fit_chars(s["view_width"].get_value(), s["margin_left"].get_value(), self.current_ppi())
         )
@@ -1667,7 +1686,9 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
     def _sync_line_limits(self, *_):
         total = max(1, int(self.spins["total_lines"].get_value()))
-        self.spins["lines_per_page"].set_range(1, total)
+        self.spins["start_line"].set_range(0, total - 1)
+        first = int(self.spins["start_line"].get_value())
+        self.spins["lines_per_page"].set_range(1, max(1, total - first))
 
     def _on_paper_changed(self, *_):
         if self._updating:
@@ -1871,6 +1892,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             "output_dir": str(PREVIEW_DIR),
             "max_line_length": v["line_length"],
             "lines_per_page": v["lines_per_page"],
+            "start_line": v["start_line"],
             "bias": v["bias"],
             "style": v["style"],
             "ink_color": v["ink_color"],
@@ -2502,6 +2524,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             # Lift the "written <= ruled" cap first so saved values are not clamped
             # by the previous profile's ruled-line count.
             self.spins["lines_per_page"].set_range(1, 200)
+            self.spins["start_line"].set_range(0, 199)
+            self.spins["start_line"].set_value(0)  # profiles saved before this setting existed
             for key, value in (data.get("spins") or {}).items():
                 if key in self.spins and number(value):
                     self.spins[key].set_value(value)

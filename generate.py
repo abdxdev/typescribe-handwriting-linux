@@ -108,11 +108,16 @@ def process_text(job, progress=None, hand=None):
     wanted = [n for n in wanted if 1 <= n <= len(pages)]
 
     written = []
+    # Empty ruled lines left above the text. They are written as blank lines ("."), so the
+    # model skips them and everything below keeps its place on the ruling.
+    start = max(0, int(job.get("start_line", 0)))
     for n in wanted:
-        page_lines = pages[n - 1]
+        text_lines = pages[n - 1]
+        page_lines = ["."] * start + text_lines
         emit(event="page_start", n=n, total=len(pages), index=len(written), count=len(wanted))
         path = os.path.join(output_dir, f"result_page_{n}.svg")
         count = len(page_lines)
+        colors = [job["ink_color"]] * start + line_colors(job, len(text_lines))
 
         live = {}
         if job.get("live"):
@@ -129,7 +134,7 @@ def process_text(job, progress=None, hand=None):
 
             live = {
                 "on_line": on_line,
-                "first_chunk": job.get("live_first_chunk", LIVE_FIRST_CHUNK),
+                "first_chunk": job.get("live_first_chunk", LIVE_FIRST_CHUNK) + start,  # blanks cost nothing
                 "chunk_lines": job.get("live_chunk_lines", LIVE_CHUNK_LINES),
             }
 
@@ -138,7 +143,7 @@ def process_text(job, progress=None, hand=None):
             lines=page_lines,
             biases=[job["bias"]] * count,
             styles=[job["style"]] * count,
-            stroke_colors=line_colors(job, count),
+            stroke_colors=colors,
             stroke_widths=[job["pen_width"]] * count,
             page=job["page"],
             pressure=job.get("pressure", 0.0),
