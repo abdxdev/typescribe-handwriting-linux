@@ -6,6 +6,10 @@ from handwriting_synthesis import drawing
 
 DEFAULT_PAGE = [32, 24, 896, 632, -64, -96, "#fff", "#f00", "#888"]
 
+# Gap between the left margin and the red margin line (72-ppi units). A fixed value, so
+# changing the line height never moves the margin. Keep in sync with gui.py.
+MARGIN_LINE_OFFSET = 16
+
 
 def unpack_page(page):
     """Split the `page` list into named values (see gui.py `_build_job`)."""
@@ -139,8 +143,9 @@ def _draw(strokes, lines, filename, stroke_colors=None, stroke_widths=None, page
             y_position = line_height * (i + 1) - margin_top # Adjust as needed to align with text
             background.add(dwg.line(start=(0, y_position), end=(view_width, y_position), stroke=line_color, stroke_width=1))
 
-        background.add(dwg.line(start=(-margin_left + line_height/2, 0), end=(-margin_left + line_height/2, view_height), stroke=margin_color, stroke_width=1))
-        background.add(dwg.line(start=(-margin_left + line_height/2 - 5, 0), end=(-margin_left + line_height/2 - 5, view_height), stroke=margin_color, stroke_width=1))
+        margin_x = -margin_left + MARGIN_LINE_OFFSET  # independent of line height
+        background.add(dwg.line(start=(margin_x, 0), end=(margin_x, view_height), stroke=margin_color, stroke_width=1))
+        background.add(dwg.line(start=(margin_x - 5, 0), end=(margin_x - 5, view_height), stroke=margin_color, stroke_width=1))
 
         background.add(dwg.line(start=(0, -margin_top), end=(view_width, -margin_top), stroke=margin_color, stroke_width=1))
         background.add(dwg.line(start=(0, -margin_top - 5), end=(view_width, -margin_top - 5), stroke=margin_color, stroke_width=1))

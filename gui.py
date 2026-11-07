@@ -7,18 +7,19 @@ TensorFlow installed, so the interface never freezes while the model works.
 
 Layout plan - every setting and every action has exactly ONE home
 -----------------------------------------------------------------
-  Header bar    Whole-app actions: settings toggle, open text file,
-                Generate / Cancel, Export..., main menu (About).
+  Header bar    Whole-app actions: settings toggle, Generate / Cancel,
+                Export..., main menu (About).
   Sidebar       Every setting that shapes the result, scoped to a profile.
                   Profile row    switch, new, rename, reset, delete
                   Handwriting    style, strokes (consistency / thickness /
                                  pressure), ink (color / mix / second color)
                   Page           paper (size / orientation / resolution /
-                                 width / height), ruling (line height / ruled
-                                 lines / margins), text on the page
-                                 (characters per line / lines written / fit),
-                                 colors (page / margin / line)
-  Text pane     The text that gets written.
+                                 width / height), ruling (top margin / line
+                                 height / ruled lines / left margin / fit to
+                                 page), text on the page (characters per line /
+                                 start line / lines written), colors (page /
+                                 ruled lines / margins), reference image
+  Text pane     The text that gets written, and opening a text file.
   Canvas pane   Layout  - live preview of the ruled page; drag its edges, margin
                           lines and handles to change the page settings directly
                 Pages   - the generated result: browse, regenerate one page
@@ -331,6 +332,7 @@ def find_model_python():
 # --------------------------------------------------------------------------- #
 CHAR_WIDTH_UNITS = 8.3  # handwriting is roughly this wide per character (72-ppi units)
 TEXT_SLACK_UNITS = 24   # unused space kept at the right of the text block
+MARGIN_LINE_OFFSET = 16  # red margin line sits this far right of the left margin (72-ppi units); independent of line height
 
 
 def fit_lines(height, margin_top, line_height):
@@ -552,7 +554,7 @@ class PagePreview(Gtk.DrawingArea):
             y = oy + mt * scale
             segments.append((ox, y, ox + pw, y))
         if name == "margin_left":
-            x = ox + (ml + lh / 2) * scale
+            x = ox + (ml + MARGIN_LINE_OFFSET * v["ppi"] / 72) * scale
             segments.append((x, oy, x, oy + ph))
         if name == "line_height":
             segments.append(row(1))
@@ -590,7 +592,7 @@ class PagePreview(Gtk.DrawingArea):
         e = self.EDGE_HIT
         in_x = ox - e <= x <= ox + pw + e
         in_y = oy - e <= y <= oy + ph + e
-        margin_x = ox + (ml + lh / 2) * scale  # the margin is a double line, 5 px apart
+        margin_x = ox + (ml + MARGIN_LINE_OFFSET * v["ppi"] / 72) * scale  # the margin is a double line, 5 px apart
         margin_y = oy + mt * scale
         candidates = []
         if in_y:
@@ -700,7 +702,7 @@ class PagePreview(Gtk.DrawingArea):
         # Double margin lines.
         set_source(cr, v["margin_color"])
         cr.set_line_width(hairline)
-        x = ox + (ml + lh / 2) * scale
+        x = ox + (ml + MARGIN_LINE_OFFSET * v["ppi"] / 72) * scale
         for dx in (0, -5 * scale):
             cr.move_to(x + dx, oy)
             cr.line_to(x + dx, oy + ph)
@@ -1023,7 +1025,7 @@ class LivePage(Gtk.DrawingArea):
 
         set_source(cr, p["margin"])
         cr.set_line_width(hairline)
-        x = ox + (p["ml"] + p["lh"] / 2) * scale
+        x = ox + (p["ml"] + MARGIN_LINE_OFFSET) * scale
         for dx in (0, -5 * scale):
             cr.move_to(x + dx, oy)
             cr.line_to(x + dx, oy + ph)
@@ -1319,19 +1321,13 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             paper.add(row)
         page.add(paper)
 
-        # Ruling: where the lines and margins are drawn.
+        # Ruling: where the lines and margins are drawn, in the order they appear on the page
+        # (top margin, then the ruled lines down the sheet, then the left margin).
         ruling = Adw.PreferencesGroup(title="Ruling")
+        ruling.add(self._spin_row("margin_top", "Top margin", "px", 0, 10000, 0.5, 2))
         ruling.add(self._spin_row("line_height", "Line height", "px", 4, 3000, 0.5, 2))
         ruling.add(self._spin_row("total_lines", "Ruled lines per page", None, 1, 200, 1, 0))
         ruling.add(self._spin_row("margin_left", "Left margin", "px", 0, 10000, 0.5, 2))
-        ruling.add(self._spin_row("margin_top", "Top margin", "px", 0, 10000, 0.5, 2))
-        page.add(ruling)
-
-        # Text on the page: how the text is wrapped onto the ruling.
-        text = Adw.PreferencesGroup(title="Text on the page")
-        text.add(self._spin_row("line_length", "Characters per line", "Wrap limit", 20, 75, 1, 0))
-        text.add(self._spin_row("start_line", "Text starts after", "Empty ruled lines at the top", 0, 199, 1, 0))
-        text.add(self._spin_row("lines_per_page", "Lines written per page", "Up to the ruled lines", 1, 200, 1, 0))
         fit_row = Adw.ActionRow(
             title="Fit to page", subtitle="Fill the page with ruled lines and set the wrap limit",
         )
@@ -1339,7 +1335,14 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         fit_btn.connect("clicked", self._on_fit)
         fit_row.add_suffix(fit_btn)
         fit_row.set_activatable_widget(fit_btn)
-        text.add(fit_row)
+        ruling.add(fit_row)
+        page.add(ruling)
+
+        # Text on the page: how the text is wrapped onto the ruling.
+        text = Adw.PreferencesGroup(title="Text on the page")
+        text.add(self._spin_row("line_length", "Characters per line", "Wrap limit", 20, 75, 1, 0))
+        text.add(self._spin_row("start_line", "Text starts after", "Empty ruled lines at the top", 0, 199, 1, 0))
+        text.add(self._spin_row("lines_per_page", "Lines written per page", "Up to the ruled lines", 1, 200, 1, 0))
         page.add(text)
         # The text must fit between its first line and the last ruled line.
         self.spins["total_lines"].connect("notify::value", self._sync_line_limits)
@@ -1347,8 +1350,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
         colors = Adw.PreferencesGroup(title="Colors")
         colors.add(self._color_row("page_color", "Page color"))
-        colors.add(self._color_row("margin_color", "Margin color"))
-        colors.add(self._color_row("line_color", "Line color"))
+        colors.add(self._color_row("line_color", "Ruled line color"))
+        colors.add(self._color_row("margin_color", "Margin line color"))
         page.add(colors)
 
         # A picture of the real paper to line the layout up against.
@@ -1385,10 +1388,6 @@ class TypeScribeWindow(Adw.ApplicationWindow):
     # ====================================================================== #
     def _build_content(self):
         self.sidebar_toggle = Gtk.ToggleButton(icon_name="sidebar-show-symbolic", tooltip_text="Settings (F9)")
-        open_btn = Gtk.Button(
-            icon_name="document-open-symbolic", tooltip_text="Open text file (Ctrl+O)",
-            action_name="win.open-text",
-        )
 
         menu = Gio.Menu()
         menu.append("About TypeScribe", "win.about")
@@ -1403,7 +1402,6 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         header.set_title_widget(self.window_title)
         header.pack_start(self.sidebar_toggle)
-        header.pack_start(open_btn)
         header.pack_end(menu_btn)
         header.pack_end(self.export_btn)
         header.pack_end(self.generate_btn)
@@ -1454,7 +1452,16 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
         title = Gtk.Label(label="Text", xalign=0, hexpand=True)
         title.add_css_class("heading")
-        return self._pane(title, overlay)
+        open_btn = Gtk.Button(
+            child=Adw.ButtonContent(icon_name="document-open-symbolic", label="Open…"),
+            tooltip_text="Open a text file (Ctrl+O)", action_name="win.open-text",
+            valign=Gtk.Align.CENTER,
+        )
+        open_btn.add_css_class("flat")
+        text_header = Gtk.Box(spacing=8, hexpand=True)
+        text_header.append(title)
+        text_header.append(open_btn)
+        return self._pane(text_header, overlay)
 
     def _build_canvas_pane(self):
         self.preview = PagePreview(self.values, self._on_layout_drag)
