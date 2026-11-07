@@ -84,12 +84,12 @@ def main():
     # Page parameters to be stored in page array
     # Parameters for A4 page with 24 lines, 32px line height, 0.707 aspect ratio, 64px left and 96px top margins
 
-    line_height = 32
+    line_height = 32.0
     total_lines_per_page = 24
     view_height = 896
     view_width = view_height * 0.707
-    margin_left = -64
-    margin_top = -96
+    margin_left = -64.0
+    margin_top = -96.0
     page_color, margin_color, line_color = "white", "red", "lightgrey"
 
     page = [line_height, total_lines_per_page, view_height, view_width, margin_left, margin_top, page_color, margin_color, line_color]

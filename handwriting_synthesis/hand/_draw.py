@@ -53,18 +53,22 @@ def _draw(strokes, lines, filename, stroke_colors=None, stroke_widths=None, page
     dwg.viewbox(width=view_width, height=view_height)
 
     if include_background:
-        dwg.add(dwg.rect(insert=(0, 0), size=(view_width, view_height), fill=page_color))
+        # Tagged so exports can leave the paper and rules out while keeping the ink.
+        background = dwg.g(id="page-background")
+        background.add(dwg.rect(insert=(0, 0), size=(view_width, view_height), fill=page_color))
 
         # Draw fixed number of ruled lines
         for i in range(total_lines_per_page):
             y_position = line_height * (i + 1) - margin_top # Adjust as needed to align with text
-            dwg.add(dwg.line(start=(0, y_position), end=(view_width, y_position), stroke=line_color, stroke_width=1))
+            background.add(dwg.line(start=(0, y_position), end=(view_width, y_position), stroke=line_color, stroke_width=1))
 
-        dwg.add(dwg.line(start=(-margin_left + line_height/2, 0), end=(-margin_left + line_height/2, view_height), stroke=margin_color, stroke_width=1))
-        dwg.add(dwg.line(start=(-margin_left + line_height/2 - 5, 0), end=(-margin_left + line_height/2 - 5, view_height), stroke=margin_color, stroke_width=1))
+        background.add(dwg.line(start=(-margin_left + line_height/2, 0), end=(-margin_left + line_height/2, view_height), stroke=margin_color, stroke_width=1))
+        background.add(dwg.line(start=(-margin_left + line_height/2 - 5, 0), end=(-margin_left + line_height/2 - 5, view_height), stroke=margin_color, stroke_width=1))
 
-        dwg.add(dwg.line(start=(0, -margin_top), end=(view_width, -margin_top), stroke=margin_color, stroke_width=1))
-        dwg.add(dwg.line(start=(0, -margin_top - 5), end=(view_width, -margin_top - 5), stroke=margin_color, stroke_width=1))
+        background.add(dwg.line(start=(0, -margin_top), end=(view_width, -margin_top), stroke=margin_color, stroke_width=1))
+        background.add(dwg.line(start=(0, -margin_top - 5), end=(view_width, -margin_top - 5), stroke=margin_color, stroke_width=1))
+
+        dwg.add(background)
 
 
     initial_coord = np.array([margin_left, margin_top - line_height/2])

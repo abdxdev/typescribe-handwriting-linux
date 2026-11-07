@@ -23,6 +23,7 @@ Got you covered.
 ### Features
 - **Realistic Handwriting Generation with a Recurrent Neural Network (RNN)**
 - **Choose from 12 predefined handwriting styles.**
+- **Save complete settings as reusable profiles, and switch between them.**
 - **Adjust line spacing, page size, margins, ink color, pen thickness, and more.**
 - **User-friendly interface**
 - **Automatically splits large texts into multiple lines, paragraphs and pages.**
