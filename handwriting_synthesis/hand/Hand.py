@@ -5,7 +5,7 @@ import numpy as np
 
 from handwriting_synthesis import drawing
 from handwriting_synthesis.config import prediction_path, checkpoint_path, style_path
-from handwriting_synthesis.hand._draw import _draw
+from handwriting_synthesis.hand._draw import _draw, page_line_pieces, unpack_page
 from handwriting_synthesis.rnn import RNN
 
 
@@ -37,7 +37,28 @@ class Hand(object):
         )
         self.nn.restore()
 
-    def write(self, filename, lines, biases=None, styles=None, stroke_colors=None, stroke_widths=None, page=None, pressure=0.0):
+    @staticmethod
+    def _batches(total, first_chunk, chunk_lines):
+        """(start, stop) line ranges to sample together; one range when not chunking."""
+        if not chunk_lines:
+            return [(0, total)]
+        batches, start, size = [], 0, first_chunk or chunk_lines
+        while start < total:
+            batches.append((start, min(total, start + size)))
+            start += size
+            size = chunk_lines
+        return batches
+
+    def write(self, filename, lines, biases=None, styles=None, stroke_colors=None, stroke_widths=None, page=None,
+              pressure=0.0, on_line=None, first_chunk=None, chunk_lines=None):
+        """Write `lines` as handwriting to an SVG page (plus a PNG).
+
+        With `chunk_lines` the lines are sampled a few at a time instead of all at once
+        (a small `first_chunk` gets ink on screen sooner). After each chunk
+        `on_line(index, pieces, color)` is called for every line that has ink, where
+        `pieces` is a list of (points, width) in page units. Chunking only changes
+        when ink becomes available, not how it looks.
+        """
         valid_char_set = set(drawing.alphabet)
         
         for line_num, line in enumerate(lines):
@@ -58,10 +79,29 @@ class Hand(object):
                         ).format(char, line_num, valid_char_set)
                     )
 
-        strokes = self._sample(lines, biases=biases, styles=styles)
-        lines = ['' if line == '.' else line for line in lines]
-        _draw(strokes, lines, filename, stroke_colors=stroke_colors, stroke_widths=stroke_widths, page=page,
-              pressure=pressure)
+        count = len(lines)
+        stroke_colors = stroke_colors or ['black'] * count
+        stroke_widths = stroke_widths or [2] * count
+        limit = unpack_page(page)["total_lines"]
+
+        drawn_lines = ['' if line == '.' else line for line in lines]
+        pieces = [None] * count
+        for start, stop in self._batches(count, first_chunk, chunk_lines):
+            # Blank lines and lines past the ruled page are never drawn, so don't sample them.
+            batch = [i for i in range(start, stop) if drawn_lines[i] and i < limit]
+            if batch:
+                strokes = self._sample(
+                    [lines[i] for i in batch],
+                    biases=None if biases is None else [biases[i] for i in batch],
+                    styles=None if styles is None else [styles[i] for i in batch],
+                )
+                for i, offsets in zip(batch, strokes):
+                    pieces[i] = page_line_pieces(offsets, i, page, stroke_widths[i], pressure)
+                    if on_line:
+                        on_line(i, pieces[i], stroke_colors[i])
+
+        _draw(None, drawn_lines, filename, stroke_colors=stroke_colors, stroke_widths=stroke_widths, page=page,
+              pressure=pressure, pieces=pieces)
 
     def _sample(self, lines, biases=None, styles=None):
         num_samples = len(lines)

@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import sys
+from collections import deque
 from pathlib import Path
 
 try:
@@ -813,6 +814,242 @@ class PagePreview(Gtk.DrawingArea):
 
 
 # --------------------------------------------------------------------------- #
+# Live page - the pen writing while the model is still generating
+# --------------------------------------------------------------------------- #
+class LivePage(Gtk.DrawingArea):
+    """Draws the ruled page and the handwriting strokes as they arrive from the worker.
+
+    The worker reports the ink line by line (see generate.py). Received strokes are queued
+    and replayed point by point, like a pen moving over the paper: faster when a lot of
+    ink is waiting, so the drawing never falls far behind the model. A pen tip marks
+    the point being written.
+    """
+
+    PAD = 28
+    FIT = 0.92                # same framing as PagePreview, so switching tabs does not jump
+    FRAME_MS = 16
+    BASE_POINTS = 5           # points drawn per frame when nothing is waiting
+    CATCH_UP = 120            # one extra point per frame for every this many points waiting
+    FINISH_POINTS = 60        # points per frame once the model is done
+    PAGE_HOLD_FRAMES = 50     # how long a finished page stays before the next one starts
+
+    def __init__(self):
+        super().__init__(hexpand=True, vexpand=True)
+        self.set_content_width(240)
+        self.set_content_height(300)
+        self.add_css_class("page-preview")
+        self.set_draw_func(self._draw)
+        self.page = None
+        self._geom = None
+        self._tick_id = 0
+        self._finish = None
+        self._reset_state()
+
+    def _reset_state(self):
+        self.queue = deque()   # (color, width, flat points) pieces; None marks a new page
+        self.waiting = 0       # points queued but not drawn yet
+        self.hold = 0
+        self.inks = []         # pieces that are being or have been drawn
+        self.current = None
+        self.pen = None
+        self.active = False
+        self._ink_surface = None
+        self._ink_key = None
+
+    # ---- feeding ------------------------------------------------------------ #
+    def begin(self, page):
+        """Start a fresh sheet. `page` is the job's page list (72-ppi units, negative margins)."""
+        self.stop()
+        line_height, total_lines, height, width, margin_left, margin_top, page_color, margin_color, line_color = page[:9]
+        self.page = {
+            "w": width, "h": height, "lh": line_height, "lines": int(total_lines),
+            "ml": -margin_left, "mt": -margin_top,
+            "paper": page_color, "margin": margin_color, "rule": line_color,
+        }
+        self.active = True
+        self.queue_draw()
+
+    def stop(self):
+        """Drop whatever is queued and clear the sheet."""
+        if self._tick_id:
+            GLib.source_remove(self._tick_id)
+            self._tick_id = 0
+        self._finish = None
+        self._reset_state()
+        self.queue_draw()
+
+    def new_page(self):
+        self.queue.append(None)
+        self._wake()
+
+    def add_line(self, color, pieces):
+        for piece in pieces:
+            points = piece.get("p") or []
+            if len(points) >= 4:
+                self.queue.append((color, float(piece.get("w", 1.0)), points))
+                self.waiting += len(points) // 2
+        self._wake()
+
+    def finish(self, callback):
+        """Call `callback` once everything received so far has been drawn."""
+        self._finish = callback
+        self._wake()
+
+    def _wake(self):
+        if not self._tick_id:
+            self._tick_id = GLib.timeout_add(self.FRAME_MS, self._tick)
+
+    # ---- playback ------------------------------------------------------------ #
+    def _clear_ink(self):
+        self.inks, self.current, self.pen = [], None, None
+        self._ink_surface = None
+
+    def _tick(self):
+        changed = False
+        if self.hold:
+            self.hold -= 1
+            if self.hold == 0:
+                self._clear_ink()  # the finished page has been seen; start the next sheet
+                changed = True
+        else:
+            budget = self.BASE_POINTS + self.waiting // self.CATCH_UP
+            if self._finish:
+                budget = max(budget, self.FINISH_POINTS)
+            while budget > 0:
+                if self.current is None:
+                    if not self.queue:
+                        break
+                    item = self.queue.popleft()
+                    if item is None:  # a new page begins
+                        if self.inks:
+                            self.hold = self.PAGE_HOLD_FRAMES
+                            break
+                        continue
+                    color, width, points = item
+                    self.current = {"rgba": parse_rgba(color), "w": width, "pts": points,
+                                    "n": len(points) // 2, "i": 0}
+                    self.inks.append(self.current)
+                current = self.current
+                take = min(budget, current["n"] - current["i"])
+                self._reveal(current, take)
+                budget -= take
+                self.waiting -= take
+                changed = True
+                if current["i"] >= current["n"]:
+                    self.current = None
+        if changed:
+            self.queue_draw()
+
+        idle = not self.queue and self.current is None and not self.hold
+        if idle and self._finish:
+            callback, self._finish = self._finish, None
+            self._tick_id = 0
+            callback()
+            return False
+        if idle:
+            self._tick_id = 0  # nothing to draw until the next line arrives
+            return False
+        return True
+
+    def _reveal(self, piece, take):
+        points, start = piece["pts"], piece["i"]
+        begin = max(0, start - 1)  # join up with the point drawn last
+        end = start + take
+        segment = [(points[2 * k], points[2 * k + 1]) for k in range(begin, end)]
+        piece["i"] = end
+        self.pen = segment[-1]
+        if len(segment) >= 2 and self._ink_surface is not None and self._geom is not None:
+            self._stroke(cairo.Context(self._ink_surface), piece["rgba"], piece["w"], segment)
+
+    def _stroke(self, cr, rgba, width, segment):
+        scale, ox, oy = self._geom
+        cr.set_source_rgba(rgba.red, rgba.green, rgba.blue, 1.0)
+        cr.set_line_width(max(0.6, width * scale))
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        x, y = segment[0]
+        cr.move_to(ox + x * scale, oy + y * scale)
+        for x, y in segment[1:]:
+            cr.line_to(ox + x * scale, oy + y * scale)
+        cr.stroke()
+
+    # ---- drawing -------------------------------------------------------------- #
+    def _draw(self, area, cr, width, height):
+        p = self.page
+        if p is None:
+            return
+        scale = min((width - 2 * self.PAD) / p["w"], (height - 2 * self.PAD) / p["h"]) * self.FIT
+        if scale <= 0:
+            return
+        ox, oy = (width - p["w"] * scale) / 2, (height - p["h"] * scale) / 2
+        self._geom = (scale, ox, oy)
+        pw, ph = p["w"] * scale, p["h"] * scale
+        hairline = max(1.0, scale)
+
+        # Paper with a soft shadow, ruled lines and margins (same geometry as the SVG).
+        cr.set_source_rgba(0, 0, 0, 0.18)
+        cr.rectangle(ox + 2, oy + 3, pw, ph)
+        cr.fill()
+        set_source(cr, p["paper"])
+        cr.rectangle(ox, oy, pw, ph)
+        cr.fill()
+
+        cr.save()
+        cr.rectangle(ox, oy, pw, ph)
+        cr.clip()
+
+        set_source(cr, p["rule"])
+        cr.set_line_width(hairline)
+        for i in range(p["lines"]):
+            y = oy + (p["lh"] * (i + 1) + p["mt"]) * scale
+            cr.move_to(ox, y)
+            cr.line_to(ox + pw, y)
+        cr.stroke()
+
+        set_source(cr, p["margin"])
+        cr.set_line_width(hairline)
+        x = ox + (p["ml"] + p["lh"] / 2) * scale
+        for dx in (0, -5 * scale):
+            cr.move_to(x + dx, oy)
+            cr.line_to(x + dx, oy + ph)
+        y = oy + p["mt"] * scale
+        for dy in (0, -5 * scale):
+            cr.move_to(ox, y + dy)
+            cr.line_to(ox + pw, y + dy)
+        cr.stroke()
+
+        # The ink lives on its own surface so each frame only adds the newest segments.
+        factor = self.get_scale_factor()
+        key = (width, height, factor)
+        if self._ink_surface is None or self._ink_key != key:
+            self._ink_surface = cairo.ImageSurface(
+                cairo.FORMAT_ARGB32, max(1, int(width * factor)), max(1, int(height * factor)),
+            )
+            self._ink_surface.set_device_scale(factor, factor)
+            self._ink_key = key
+            ink_cr = cairo.Context(self._ink_surface)
+            for piece in self.inks:
+                drawn = piece["i"]
+                if drawn >= 2:
+                    points = piece["pts"]
+                    self._stroke(ink_cr, piece["rgba"], piece["w"],
+                                 [(points[2 * k], points[2 * k + 1]) for k in range(drawn)])
+        cr.set_source_surface(self._ink_surface, 0, 0)
+        cr.paint()
+        cr.restore()
+
+        if self.active and self.pen is not None:  # the pen tip
+            ar, ag, ab = accent_rgb()
+            cr.new_sub_path()
+            cr.arc(ox + self.pen[0] * scale, oy + self.pen[1] * scale, 4.0, 0, 2 * math.pi)
+            cr.set_source_rgba(ar, ag, ab, 0.9)
+            cr.fill_preserve()
+            cr.set_source_rgba(1, 1, 1, 0.95)
+            cr.set_line_width(1.2)
+            cr.stroke()
+
+
+# --------------------------------------------------------------------------- #
 # Color button
 # --------------------------------------------------------------------------- #
 class ColorButton(Gtk.MenuButton):
@@ -1215,10 +1452,12 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         layout_view.append(self.preview)
         layout_view.append(hint)
 
+        self.live = LivePage()
         self.canvas_stack = Gtk.Stack(
             vexpand=True, hexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE,
         )
         self.canvas_stack.add_named(layout_view, "layout")
+        self.canvas_stack.add_named(self.live, "live")  # shown only while writing; not a tab
         self.canvas_stack.add_named(self._build_result_view(), "pages")
 
         # Two-way tab control; "Pages" stays disabled until something was generated.
@@ -1573,6 +1812,14 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
     def _show_canvas(self, name):
         (self.pages_tab if name == "pages" else self.layout_tab).set_active(True)
+        # Setting an already-active tab emits nothing, so switch the stack explicitly
+        # (it may be showing the live page, which has no tab).
+        self.canvas_stack.set_visible_child_name(name)
+
+    def _reveal_pages(self):
+        """The pen has finished the last page: show the generated pages, unless the user left."""
+        if self.canvas_stack.get_visible_child_name() == "live":
+            self._show_canvas("pages")
 
     def _show_page(self, index):
         if not self.result_pages:
@@ -1631,6 +1878,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             "ink_mode": v["ink_mode"],
             "pressure": v["pressure"],
             "pen_width": v["pen_width"],
+            "live": True,  # stream each line's strokes back while the page is being written
             # The model lays out in 72-ppi units; the export is scaled to the chosen ppi.
             # The paper is always rendered; "transparent export" strips it at export time,
             # so that choice never costs a regeneration.
@@ -1699,6 +1947,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
         self.run = {"job": job, "only_page": only_page}
         self.progress_fraction = None
+        self.live.begin(job["page"])  # a blank ruled sheet the pen writes on
         self._set_running(True)
         self._set_status("Starting…")
         try:
@@ -1719,6 +1968,10 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.preview.queue_draw()
         self.text_view.set_editable(not running)
         self.progress.set_visible(running)
+        self.layout_tab.set_sensitive(not running)
+        self.pages_tab.set_sensitive(not running and bool(self.result_pages))
+        if running:
+            self.canvas_stack.set_visible_child_name("live")  # watch the pen write
         self.generate_btn.set_label("Cancel" if running else "Generate")
         if running:
             self.generate_btn.remove_css_class("suggested-action")
@@ -1759,6 +2012,9 @@ class TypeScribeWindow(Adw.ApplicationWindow):
                 self._set_status("Loading the handwriting model…")
             elif kind == "page_start":
                 self._set_status(f"Writing page {event.get('n')} of {event.get('total')}…")
+                self.live.new_page()
+            elif kind == "line":
+                self.live.add_line(event.get("color", "#000000"), event.get("pieces", []))
             elif kind == "page_done":
                 self.progress_fraction = event.get("index", 0) / max(1, event.get("count", 1))
                 self.progress.set_fraction(self.progress_fraction)
@@ -1793,8 +2049,12 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self._refresh()
 
         if cancelled:
+            self.live.stop()
+            self._show_canvas("pages" if self.pages_tab.get_active() else "layout")
             self.toast("Generation cancelled")
         elif not succeeded:
+            self.live.stop()
+            self._show_canvas("pages" if self.pages_tab.get_active() else "layout")
             tail = ""
             try:
                 tail = "\n".join(self.log_path.read_text(errors="replace").splitlines()[-15:])
@@ -1803,8 +2063,9 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             self.alert("Generation failed", error or "The generator produced no pages.", tail or None)
         else:
             self.pages_tab.set_sensitive(True)
-            self._show_page(index)
-            self._show_canvas("pages")
+            self._show_page(index)  # loaded behind the live view, ready for the reveal
+            # The pen may still be catching up with the model; show the result once it is done.
+            self.live.finish(self._reveal_pages)
             count = len(self.result_pages)
             if run["only_page"] is None:
                 self.toast(f"Generated {count} page{'s' if count != 1 else ''}")

@@ -24,6 +24,11 @@ ALPHABET = [
     "y", "z",
 ]
 
+# Live drawing: lines are sampled in small groups so ink appears early. The first group is
+# tiny (ink shows up quickly), later ones are bigger (batched sampling is faster per line).
+LIVE_FIRST_CHUNK = 2
+LIVE_CHUNK_LINES = 6
+
 
 def unsupported_chars(text, alphabet=ALPHABET):
     """Characters in `text` the model cannot write (whitespace is fine)."""
@@ -108,6 +113,26 @@ def process_text(job, progress=None, hand=None):
         emit(event="page_start", n=n, total=len(pages), index=len(written), count=len(wanted))
         path = os.path.join(output_dir, f"result_page_{n}.svg")
         count = len(page_lines)
+
+        live = {}
+        if job.get("live"):
+            # Sample a few lines at a time and report each line's ink as soon as it exists,
+            # so the GUI can draw the pen strokes while the rest of the page is still being made.
+            def on_line(index, pieces, color, n=n):
+                emit(
+                    event="line", n=n, line=index, color=color,
+                    pieces=[
+                        {"w": width, "p": [round(float(v), 2) for point in points for v in point]}
+                        for points, width in pieces
+                    ],
+                )
+
+            live = {
+                "on_line": on_line,
+                "first_chunk": job.get("live_first_chunk", LIVE_FIRST_CHUNK),
+                "chunk_lines": job.get("live_chunk_lines", LIVE_CHUNK_LINES),
+            }
+
         hand.write(
             filename=path,
             lines=page_lines,
@@ -117,6 +142,7 @@ def process_text(job, progress=None, hand=None):
             stroke_widths=[job["pen_width"]] * count,
             page=job["page"],
             pressure=job.get("pressure", 0.0),
+            **live,
         )
         written.append(path)
         emit(event="page_done", n=n, total=len(pages), index=len(written), count=len(wanted), path=path)
