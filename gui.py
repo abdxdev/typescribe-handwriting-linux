@@ -432,6 +432,72 @@ def rounded_rect(cr, x, y, w, h, r):
     cr.close_path()
 
 
+class TabSwitcher:
+    """Two-or-more way tabs: a round Adw.ToggleGroup (libadwaita 1.7+) or linked toggle buttons.
+
+    `items` is a list of (name, label, icon, tooltip). `on_change(name)` runs when the user
+    (or set_active) picks a tab. Individual tabs can be disabled with set_enabled.
+    """
+
+    def __init__(self, items, on_change):
+        self._on_change = on_change
+        self._native = hasattr(Adw, "ToggleGroup")
+        first = self._last = items[0][0]
+        self._quiet = False
+        if self._native:
+            self.widget = Adw.ToggleGroup(valign=Gtk.Align.CENTER)
+            self.widget.add_css_class("round")
+            for name, label, icon, tooltip in items:
+                self.widget.add(Adw.Toggle(name=name, label=label, icon_name=icon, tooltip=tooltip))
+            self.widget.set_active_name(first)
+            self.widget.connect("notify::active-name", self._on_group_changed)
+        else:
+            self.widget = Gtk.Box(valign=Gtk.Align.CENTER)
+            self.widget.add_css_class("linked")
+            self._buttons, group = {}, None
+            for name, label, _icon, tooltip in items:
+                button = Gtk.ToggleButton(label=label, tooltip_text=tooltip)
+                if group is None:
+                    group = button
+                    button.set_active(True)
+                else:
+                    button.set_group(group)
+                button.connect("toggled", lambda b, n=name: b.get_active() and self._on_change(n))
+                self._buttons[name] = button
+                self.widget.append(button)
+
+    def _on_group_changed(self, *_):
+        name = self.widget.get_active_name()
+        if name and not self._quiet:  # a disabled active tab clears the selection; that is not a choice
+            self._last = name
+            self._on_change(name)
+
+    @property
+    def active(self):
+        """The chosen tab (remembered while its toggle is disabled)."""
+        if self._native:
+            return self._last
+        return next(name for name, button in self._buttons.items() if button.get_active())
+
+    def set_active(self, name):
+        if self._native:
+            self._last = name
+            self.widget.set_active_name(name)
+        else:
+            self._buttons[name].set_active(True)
+
+    def set_enabled(self, name, enabled):
+        if self._native:
+            self.widget.get_toggle_by_name(name).set_enabled(enabled)
+            chosen = self.widget.get_toggle_by_name(self._last)
+            if self.widget.get_active_name() is None and chosen.get_enabled():
+                self._quiet = True  # put the selection back without switching the page
+                self.widget.set_active_name(self._last)
+                self._quiet = False
+        else:
+            self._buttons[name].set_sensitive(enabled)
+
+
 # --------------------------------------------------------------------------- #
 # Page layout preview - also the interactive layout editor
 # --------------------------------------------------------------------------- #
@@ -1218,14 +1284,23 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.view_stack.add_titled_with_icon(
             self._build_page_tab(), "page", "Page", "x-office-document-symbolic",
         )
-        switcher = Adw.ViewSwitcher(policy=Adw.ViewSwitcherPolicy.WIDE, stack=self.view_stack)
+        if hasattr(Adw, "InlineViewSwitcher"):  # libadwaita 1.7+
+            switcher = Adw.InlineViewSwitcher(stack=self.view_stack)
+            switcher.set_display_mode(Adw.InlineViewSwitcherDisplayMode.BOTH)
+            switcher.add_css_class("round")
+        else:
+            switcher = Adw.ViewSwitcher(policy=Adw.ViewSwitcherPolicy.WIDE, stack=self.view_stack)
         header = Adw.HeaderBar(show_end_title_buttons=False)
         header.set_title_widget(switcher)
 
         # The profile is the scope of everything below it, so it sits above both tabs.
         self.profile_row = Adw.ComboRow(
-            title="Profile", tooltip_text="Handwriting and page settings are saved per profile",
+            title="Profile", use_subtitle=True,
+            tooltip_text="Handwriting and page settings are saved per profile",
         )
+        self.profile_row.add_css_class("property")
+        self.profile_avatar = Adw.Avatar(size=36, text=DEFAULT_PROFILE, show_initials=True)
+        self.profile_row.add_prefix(self.profile_avatar)
         self.profile_row.connect("notify::selected", self._on_profile_selected)
         profile_menu = Gio.Menu()
         edit_section = Gio.Menu()
@@ -1423,15 +1498,15 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.content_view.add_top_bar(header)
         self.content_view.add_bottom_bar(bar)
 
-    def _pane(self, header_widget, body):
-        """A pane = a fixed-height header strip, a separator, then the body."""
-        header = Gtk.Box(spacing=8, margin_start=14, margin_end=14, height_request=48)
-        header.append(header_widget)
-        pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
-        pane.append(header)
-        pane.append(Gtk.Separator())
-        pane.append(body)
-        return pane
+    def _pane(self, toolbar_children, body):
+        """A pane = a standard toolbar row on top (Adw.ToolbarView), then the body."""
+        toolbar = Gtk.Box(spacing=6)
+        toolbar.add_css_class("toolbar")
+        for child in toolbar_children:
+            toolbar.append(child)
+        view = Adw.ToolbarView(content=body, top_bar_style=Adw.ToolbarStyle.RAISED_BORDER, hexpand=True, vexpand=True)
+        view.add_top_bar(toolbar)
+        return view
 
     def _build_text_pane(self):
         self.buffer = Gtk.TextBuffer()
@@ -1450,18 +1525,18 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         overlay = Gtk.Overlay(child=scroller)
         overlay.add_overlay(self.placeholder)
 
-        title = Gtk.Label(label="Text", xalign=0, hexpand=True)
+        title = Gtk.Label(label="Text", xalign=0)
         title.add_css_class("heading")
+        self.text_counter = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        self.text_counter.add_css_class("dim-label")
+        self.text_counter.add_css_class("caption")
         open_btn = Gtk.Button(
-            child=Adw.ButtonContent(icon_name="document-open-symbolic", label="Open…"),
+            child=Adw.ButtonContent(icon_name="folder-open-symbolic", label="Open…"),
             tooltip_text="Open a text file (Ctrl+O)", action_name="win.open-text",
             valign=Gtk.Align.CENTER,
         )
         open_btn.add_css_class("flat")
-        text_header = Gtk.Box(spacing=8, hexpand=True)
-        text_header.append(title)
-        text_header.append(open_btn)
-        return self._pane(text_header, overlay)
+        return self._pane([title, self.text_counter, open_btn], overlay)
 
     def _build_canvas_pane(self):
         self.preview = PagePreview(self.values, self._on_layout_drag)
@@ -1485,17 +1560,14 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.canvas_stack.add_named(self._build_result_view(), "pages")
 
         # Two-way tab control; "Pages" stays disabled until something was generated.
-        self.layout_tab = Gtk.ToggleButton(label="Layout", active=True,
-                                           tooltip_text="Live preview of the ruled page")
-        self.pages_tab = Gtk.ToggleButton(label="Pages", group=self.layout_tab, sensitive=False,
-                                          tooltip_text="Generate to see the written pages")
-        self.layout_tab.connect("toggled", self._on_canvas_tab)
-        self.pages_tab.connect("toggled", self._on_canvas_tab)
-        tabs = Gtk.Box(valign=Gtk.Align.CENTER)
-        tabs.add_css_class("linked")
-        tabs.append(self.layout_tab)
-        tabs.append(self.pages_tab)
-        return self._pane(tabs, self.canvas_stack)
+        self.canvas_tabs = TabSwitcher([
+            ("layout", "Layout", "document-page-setup-symbolic", "Live preview of the ruled page"),
+            ("pages", "Pages", "view-paged-symbolic", "Generate to see the written pages"),
+        ], self._on_canvas_tab)
+        self.canvas_tabs.set_enabled("pages", False)
+        self.canvas_tabs.widget.set_hexpand(True)
+        self.canvas_tabs.widget.set_halign(Gtk.Align.CENTER)
+        return self._pane([self.canvas_tabs.widget], self.canvas_stack)
 
     def _build_result_view(self):
         self.picture = Gtk.Picture(
@@ -1758,6 +1830,9 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
     def _on_text_changed(self, *_):
         self.placeholder.set_visible(self.buffer.get_char_count() == 0)
+        text = self.get_text()
+        words = len(text.split())
+        self.text_counter.set_text(f"{words} word{'s' if words != 1 else ''} · {len(text)} chars" if text.strip() else "")
         if self.export_opts.get("name_auto", True):
             self.export_opts["name"] = derive_base_name(self.get_text())
         self._refresh()
@@ -1834,12 +1909,11 @@ class TypeScribeWindow(Adw.ApplicationWindow):
     # ====================================================================== #
     # Canvas tabs and page browser
     # ====================================================================== #
-    def _on_canvas_tab(self, button):
-        if button.get_active():
-            self.canvas_stack.set_visible_child_name("pages" if button is self.pages_tab else "layout")
+    def _on_canvas_tab(self, name):
+        self.canvas_stack.set_visible_child_name(name)
 
     def _show_canvas(self, name):
-        (self.pages_tab if name == "pages" else self.layout_tab).set_active(True)
+        self.canvas_tabs.set_active(name)
         # Setting an already-active tab emits nothing, so switch the stack explicitly
         # (it may be showing the live page, which has no tab).
         self.canvas_stack.set_visible_child_name(name)
@@ -1997,8 +2071,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.preview.queue_draw()
         self.text_view.set_editable(not running)
         self.progress.set_visible(running)
-        self.layout_tab.set_sensitive(not running)
-        self.pages_tab.set_sensitive(not running and bool(self.result_pages))
+        self.canvas_tabs.set_enabled("layout", not running)
+        self.canvas_tabs.set_enabled("pages", not running and bool(self.result_pages))
         if running:
             self.canvas_stack.set_visible_child_name("live")  # watch the pen write
         self.generate_btn.set_label("Cancel" if running else "Generate")
@@ -2079,11 +2153,11 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
         if cancelled:
             self.live.stop()
-            self._show_canvas("pages" if self.pages_tab.get_active() else "layout")
+            self._show_canvas(self.canvas_tabs.active)
             self.toast("Generation cancelled")
         elif not succeeded:
             self.live.stop()
-            self._show_canvas("pages" if self.pages_tab.get_active() else "layout")
+            self._show_canvas(self.canvas_tabs.active)
             tail = ""
             try:
                 tail = "\n".join(self.log_path.read_text(errors="replace").splitlines()[-15:])
@@ -2091,7 +2165,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
                 pass
             self.alert("Generation failed", error or "The generator produced no pages.", tail or None)
         else:
-            self.pages_tab.set_sensitive(True)
+            self.canvas_tabs.set_enabled("pages", True)
             self._show_page(index)  # loaded behind the live view, ready for the reveal
             # The pen may still be catching up with the model; show the result once it is done.
             self.live.finish(self._reveal_pages)
@@ -2334,6 +2408,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.profile_row.set_selected(index)
         self._updating = False
         self.window_title.set_subtitle(self.active_profile)
+        self.profile_avatar.set_text(self.active_profile)
         self._set_action_enabled("profile-delete", len(self.profiles) > 1)
 
     def _flush_settings(self):
