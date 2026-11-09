@@ -8,7 +8,7 @@ TensorFlow installed, so the interface never freezes while the model works.
 Layout plan - every setting and every action has exactly ONE home
 -----------------------------------------------------------------
   Header bar    Whole-app actions: settings toggle, Generate / Cancel,
-                Export..., main menu (About).
+                Export... | Print..., main menu (About).
   Sidebar       Every setting that shapes the result, scoped to a profile.
                   Profile row    switch, new, rename, reset, delete
                   Handwriting    style, strokes (consistency / thickness /
@@ -25,6 +25,9 @@ Layout plan - every setting and every action has exactly ONE home
                 Pages   - the generated result: browse, regenerate one page
   Export dialog Everything about saving: folder, file name, formats, page
                 background. Opened from the header, nowhere else.
+  Print dialog  The system print dialog (header, next to Export, or Ctrl+P). It prints the
+                generated pages, with or without the page background as set in
+                the Export dialog.
   Status bar    State, warnings and progress (read-only).
 
 Toasts are feedback only; they never carry actions or settings.
@@ -109,6 +112,8 @@ DEFAULTS = {
     "margin_color": "#ff0000",
     "line_color": "#d3d3d3",
     "reference_opacity": 50,  # percent; the reference image is for the layout preview only
+    "reference_width": 595.28,   # px; the image's own size when the reference Size is "Custom size"
+    "reference_height": 841.89,
 }
 
 # Profile settings that live in the Export dialog.
@@ -209,19 +214,33 @@ def strip_page_background(svg_text):
     return BACKGROUND_GROUP_RE.sub("", svg_text, count=1)
 
 
-REFERENCE_FITS = ["Stretch to page", "Fit inside page", "Fill page"]
+REFERENCE_FITS = ["Stretch", "Fit inside", "Fill"]
+REFERENCE_SIZES = ["Same as layout", "Custom size"]
 REFERENCE_MAX_PX = 1800  # larger images are scaled down once so dragging stays smooth
 
 
-def load_reference_surface(path):
-    """Load an image as a cairo surface for the layout preview (upright, downscaled if huge)."""
+def load_reference(path):
+    """Load an image for the layout preview (upright, downscaled) and its true pixel size."""
+    width = height = 0
+    try:
+        info = GdkPixbuf.Pixbuf.get_file_info(str(path))
+        if info and info[0] is not None:
+            width, height = info[1], info[2]
+    except (GLib.Error, OSError):
+        pass  # fall back to the size of the downscaled copy
     pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), REFERENCE_MAX_PX, REFERENCE_MAX_PX, True)
     pixbuf = pixbuf.apply_embedded_orientation() or pixbuf  # phone photos carry a rotation tag
+    if width and height:
+        # The rotation tag can turn the picture a quarter turn relative to the file's size.
+        upright = pixbuf.get_width() / pixbuf.get_height()
+        if abs(width / height - 1 / upright) < abs(width / height - upright):
+            width, height = height, width
     # Hand the pixels to cairo through an in-memory PNG (fast settings; cairo handles alpha).
     ok, data = pixbuf.save_to_bufferv("png", ["compression"], ["1"])
     if not ok:
         raise ValueError("could not decode the image")
-    return cairo.ImageSurface.create_from_png(io.BytesIO(data))
+    surface = cairo.ImageSurface.create_from_png(io.BytesIO(data))
+    return surface, (width or pixbuf.get_width(), height or pixbuf.get_height())
 
 
 def page_image(svg_path, include_background=True):
@@ -290,6 +309,37 @@ def write_pdf(svg_pages, pdf_path, include_background=True, from_png=False):
     finally:
         if pdf is not None:
             pdf.finish()
+
+
+def draw_page_fitted(cr, svg_path, box_width, box_height, include_background=True):
+    """Draw one generated page, centered and as large as fits a box (in cairo user units).
+
+    Used for printing. With librsvg the page is drawn from the SVG (vector, sharp at
+    any size); without it from the page's PNG. The aspect ratio is always kept.
+    """
+    if not include_background and Rsvg is None:
+        raise RuntimeError("Printing without the page background needs librsvg.")
+    text = Path(svg_path).read_text(encoding="utf-8", errors="replace")
+    if not include_background:
+        text = strip_page_background(text)
+    size, image = svg_text_size(text), None
+    if Rsvg is None or size is None:
+        image = page_image(svg_path, include_background)
+        size = size or (image.get_width(), image.get_height())
+    width, height = size
+    scale = min(box_width / width, box_height / height)
+    cr.save()
+    cr.translate((box_width - width * scale) / 2, (box_height - height * scale) / 2)
+    cr.scale(scale, scale)
+    if image is None:
+        viewport = Rsvg.Rectangle()
+        viewport.x, viewport.y, viewport.width, viewport.height = 0, 0, width, height
+        Rsvg.Handle.new_from_data(text.encode("utf-8")).render_document(cr, viewport)
+    else:
+        cr.scale(width / image.get_width(), height / image.get_height())
+        cr.set_source_surface(image, 0, 0)
+        cr.paint()
+    cr.restore()
 
 
 def lines_overflow(v):
@@ -442,15 +492,14 @@ class TabSwitcher:
     def __init__(self, items, on_change):
         self._on_change = on_change
         self._native = hasattr(Adw, "ToggleGroup")
-        first = self._last = items[0][0]
-        self._quiet = False
+        first = items[0][0]
         if self._native:
             self.widget = Adw.ToggleGroup(valign=Gtk.Align.CENTER)
             self.widget.add_css_class("round")
             for name, label, icon, tooltip in items:
                 self.widget.add(Adw.Toggle(name=name, label=label, icon_name=icon, tooltip=tooltip))
             self.widget.set_active_name(first)
-            self.widget.connect("notify::active-name", self._on_group_changed)
+            self.widget.connect("notify::active-name", lambda *_: self._on_change(self.active))
         else:
             self.widget = Gtk.Box(valign=Gtk.Align.CENTER)
             self.widget.add_css_class("linked")
@@ -466,22 +515,14 @@ class TabSwitcher:
                 self._buttons[name] = button
                 self.widget.append(button)
 
-    def _on_group_changed(self, *_):
-        name = self.widget.get_active_name()
-        if name and not self._quiet:  # a disabled active tab clears the selection; that is not a choice
-            self._last = name
-            self._on_change(name)
-
     @property
     def active(self):
-        """The chosen tab (remembered while its toggle is disabled)."""
         if self._native:
-            return self._last
+            return self.widget.get_active_name()
         return next(name for name, button in self._buttons.items() if button.get_active())
 
     def set_active(self, name):
         if self._native:
-            self._last = name
             self.widget.set_active_name(name)
         else:
             self._buttons[name].set_active(True)
@@ -489,11 +530,6 @@ class TabSwitcher:
     def set_enabled(self, name, enabled):
         if self._native:
             self.widget.get_toggle_by_name(name).set_enabled(enabled)
-            chosen = self.widget.get_toggle_by_name(self._last)
-            if self.widget.get_active_name() is None and chosen.get_enabled():
-                self._quiet = True  # put the selection back without switching the page
-                self.widget.set_active_name(self._last)
-                self._quiet = False
         else:
             self._buttons[name].set_sensitive(enabled)
 
@@ -571,15 +607,25 @@ class PagePreview(Gtk.DrawingArea):
         self.queue_draw()
 
     # ---- geometry --------------------------------------------------------- #
+    def _extent(self, v):
+        """Page-pixel size of everything drawn: the page, or a larger custom reference image."""
+        w, h = v["view_width"], v["view_height"]
+        if self.reference is not None and v["reference_opacity"] > 0 and v["reference_custom"]:
+            w, h = max(w, v["reference_width"]), max(h, v["reference_height"])
+        return w, h
+
     def _layout(self, width, height, v):
-        """(scale, ox, oy): widget pixels per page pixel and the page's top-left."""
+        """(scale, ox, oy): widget pixels per page pixel and the page's top-left.
+
+        The zoom fits the page and, if it sticks out past the page, the whole reference
+        image too; the page keeps the top-left corner of that area.
+        """
         if self._frozen is not None:
             return self._frozen
-        scale = min(
-            (width - 2 * self.PAD) / v["view_width"], (height - 2 * self.PAD) / v["view_height"]
-        ) * self.FIT
-        ox = (width - v["view_width"] * scale) / 2
-        oy = (height - v["view_height"] * scale) / 2
+        ew, eh = self._extent(v)
+        scale = min((width - 2 * self.PAD) / ew, (height - 2 * self.PAD) / eh) * self.FIT
+        ox = (width - ew * scale) / 2
+        oy = (height - eh * scale) / 2
         return scale, ox, oy
 
     def _knobs(self, v, scale, ox, oy):
@@ -733,28 +779,40 @@ class PagePreview(Gtk.DrawingArea):
         cr.rectangle(ox, oy, pw, ph)
         cr.fill()
 
-        cr.save()
-        cr.rectangle(ox, oy, pw, ph)
-        cr.clip()
-
-        lh, mt, ml = v["line_height"], v["margin_top"], v["margin_left"]
-
-        # Reference image (layout aid only): over the paper, under the ruling.
+        # Reference image (layout aid only): over the paper, under the ruling. A custom size
+        # can be larger than the page; the whole image then stays visible around it.
         image = self.reference
         if image is not None and v["reference_opacity"] > 0:
             iw, ih = image.get_width(), image.get_height()
-            sx, sy = pw / iw, ph / ih  # "Stretch to page"
+            if v["reference_custom"]:  # its own size, whatever the page is
+                bw, bh = v["reference_width"] * scale, v["reference_height"] * scale
+            else:
+                bw, bh = pw, ph
+            sx, sy = bw / iw, bh / ih  # "Stretch"
             if v["reference_fit"] == 1:
                 sx = sy = min(sx, sy)
             elif v["reference_fit"] == 2:
                 sx = sy = max(sx, sy)
             cr.save()
-            cr.translate(ox + (pw - iw * sx) / 2, oy + (ph - ih * sy) / 2)
+            cr.rectangle(ox, oy, bw, bh)  # "Fill" crops to its box, not to the page
+            cr.clip()
+            cr.translate(ox + (bw - iw * sx) / 2, oy + (bh - ih * sy) / 2)
             cr.scale(sx, sy)
             cr.set_source_surface(image, 0, 0)
             cr.get_source().set_filter(cairo.FILTER_GOOD)
             cr.paint_with_alpha(v["reference_opacity"])
             cr.restore()
+            if v["reference_custom"]:  # keep the page's edge readable under the picture
+                cr.set_source_rgba(0.5, 0.5, 0.5, 0.9)
+                cr.set_line_width(1)
+                cr.rectangle(ox + 0.5, oy + 0.5, pw - 1, ph - 1)
+                cr.stroke()
+
+        cr.save()
+        cr.rectangle(ox, oy, pw, ph)
+        cr.clip()
+
+        lh, mt, ml = v["line_height"], v["margin_top"], v["margin_left"]
 
         # Ruled lines (same geometry as handwriting_synthesis/hand/_draw.py).
         set_source(cr, v["line_color"])
@@ -1205,12 +1263,13 @@ class ColorButton(Gtk.MenuButton):
 PAPER_SIZES = [
     ("A3", 297, 420), ("A4", 210, 297), ("A5", 148, 210), ("A6", 105, 148),
     ("B5", 176, 250), ("Letter", 215.9, 279.4), ("Legal", 215.9, 355.6),
-    ("Tabloid", 279.4, 431.8),
+    ("Tabloid", 279.4, 431.8), ("PGC", 8 * 25.4, 12.75 * 25.4)
 ]
 PAPER_NAMES = [p[0] for p in PAPER_SIZES] + ["Custom"]
 PPI_CHOICES = [72, 96, 150, 300]
 PPI_LABELS = ["72 ppi (standard)", "96 ppi (screen)", "150 ppi", "300 ppi (print)", "Custom…"]
 DIM_KEYS = ("view_width", "view_height", "line_height", "margin_left", "margin_top")
+REFERENCE_DIM_KEYS = ("reference_width", "reference_height")
 
 
 class TypeScribeWindow(Adw.ApplicationWindow):
@@ -1219,6 +1278,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self._ready = False    # no refreshes until every widget exists
         self._loading = True   # no settings writes until startup is done
         self.reference_path = None  # layout-preview-only image (see _set_reference)
+        self.reference_size = None  # that image's full-resolution (width, height)
         self._updating = False  # suppress change handlers during programmatic updates
         self._batching = False  # several settings change at once; refresh when done
         self._save_id = 0
@@ -1239,6 +1299,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.output_dir = remembered_dir if isinstance(remembered_dir, str) and remembered_dir else None
         self.export_opts = dict(EXPORT_DEFAULTS)  # edited only in the Export dialog
         self.result_pages = []
+        self._print_op = None  # the open print job, kept alive while its dialog is up
+        self._print_error = None
         self.result_index = 0
 
         self._build_sidebar()
@@ -1452,6 +1514,18 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         )
         self.reference_fit_row.connect("notify::selected", self._refresh)
         reference.add(self.reference_fit_row)
+        self.reference_size_row = Adw.ComboRow(
+            title="Size",
+            subtitle="Match the page, or give the image its own width and height",
+            model=Gtk.StringList.new(REFERENCE_SIZES), visible=False,
+        )
+        self.reference_size_row.connect("notify::selected", self._sync_reference_rows)
+        self.reference_size_row.connect("notify::selected", self._on_reference_size_changed)
+        reference.add(self.reference_size_row)
+        for key, title in (("reference_width", "Width"), ("reference_height", "Height")):
+            row = self._spin_row(key, title, "px", 50, 30000, 1, 2)
+            row.set_visible(False)  # its own value-changed handler (_spin_row) redraws the preview
+            reference.add(row)
         self.reference_opacity_row = self._spin_row("reference_opacity", "Opacity", "%", 5, 100, 5, 0)
         self.reference_opacity_row.set_visible(False)
         reference.add(self.reference_opacity_row)
@@ -1472,13 +1546,18 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.generate_btn = Gtk.Button(label="Generate", action_name="win.generate")
         self.generate_btn.add_css_class("suggested-action")
         self.export_btn = Gtk.Button(label="Export…", action_name="win.export")
+        self.print_btn = Gtk.Button(label="Print…", action_name="win.print")
+        output_buttons = Gtk.Box(valign=Gtk.Align.CENTER)  # save or print the pages: one linked pair
+        output_buttons.add_css_class("linked")
+        output_buttons.append(self.export_btn)
+        output_buttons.append(self.print_btn)
 
         self.window_title = Adw.WindowTitle(title="TypeScribe", subtitle="")
         header = Adw.HeaderBar()
         header.set_title_widget(self.window_title)
         header.pack_start(self.sidebar_toggle)
         header.pack_end(menu_btn)
-        header.pack_end(self.export_btn)
+        header.pack_end(output_buttons)
         header.pack_end(self.generate_btn)
 
         self.status = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
@@ -1569,11 +1648,61 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.canvas_tabs.widget.set_halign(Gtk.Align.CENTER)
         return self._pane([self.canvas_tabs.widget], self.canvas_stack)
 
+    # The Pages view is zoomed relative to "fit": 100% shows the whole page (and follows the
+    # window size); higher values enlarge it and make the view scroll and pan.
+    ZOOM_MAX = 8.0
+    ZOOM_STEPS = (1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0)
+
     def _build_result_view(self):
+        self.zoom = 1.0
+        self._zoom_pending = {}  # axis -> (fraction of the page to keep under the anchor, anchor px)
+        self._pointer = None
+        self._pan_start = None
+        self._pinch_start = 1.0
+
+        margin = 12
         self.picture = Gtk.Picture(
-            can_shrink=True, content_fit=Gtk.ContentFit.CONTAIN,
-            vexpand=True, hexpand=True, margin_top=12, margin_bottom=6, margin_start=12, margin_end=12,
+            can_shrink=True, content_fit=Gtk.ContentFit.CONTAIN, hexpand=True, vexpand=True,
+            margin_top=margin, margin_bottom=margin, margin_start=margin, margin_end=margin,
         )
+        # Light backdrop so ink stays visible on transparent exports in dark mode.
+        self.page_scroller = Gtk.ScrolledWindow(child=self.picture, hexpand=True, vexpand=True)
+        self.page_scroller.add_css_class("result-paper")
+        for adjustment in (self.page_scroller.get_hadjustment(), self.page_scroller.get_vadjustment()):
+            adjustment.connect("notify::upper", self._on_zoom_extent_changed)
+            adjustment.connect("notify::page-size", self._on_viewer_resized)
+
+        scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)  # before plain scrolling
+        scroll.connect("scroll", self._on_zoom_scroll)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", lambda _c, x, y: setattr(self, "_pointer", (x, y)))
+        pinch = Gtk.GestureZoom()
+        pinch.connect("begin", lambda *_: setattr(self, "_pinch_start", self.zoom))
+        pinch.connect("scale-changed", self._on_pinch)
+        pan = Gtk.GestureDrag(button=1)
+        pan.connect("drag-begin", self._on_pan_begin)
+        pan.connect("drag-update", self._on_pan_update)
+        double_click = Gtk.GestureClick(button=1)
+        double_click.connect("pressed", self._on_page_clicked)
+        for controller in (scroll, motion, pinch, pan, double_click):
+            self.page_scroller.add_controller(controller)
+
+        self.zoom_out_btn = Gtk.Button(icon_name="zoom-out-symbolic", tooltip_text="Zoom out (Ctrl+−)")
+        self.zoom_fit_btn = Gtk.Button(label="100%", tooltip_text="Fit the whole page (Ctrl+0)")
+        self.zoom_in_btn = Gtk.Button(icon_name="zoom-in-symbolic", tooltip_text="Zoom in (Ctrl++)")
+        self.zoom_out_btn.connect("clicked", lambda *_: self._zoom_step(-1))
+        self.zoom_fit_btn.connect("clicked", lambda *_: self._set_zoom(1.0))
+        self.zoom_in_btn.connect("clicked", lambda *_: self._zoom_step(1))
+        controls = Gtk.Box(halign=Gtk.Align.END, valign=Gtk.Align.END, margin_end=14, margin_bottom=14)
+        controls.add_css_class("osd")
+        controls.add_css_class("toolbar")
+        for button in (self.zoom_out_btn, self.zoom_fit_btn, self.zoom_in_btn):
+            button.add_css_class("flat")
+            controls.append(button)
+        overlay = Gtk.Overlay(child=self.page_scroller, hexpand=True, vexpand=True)
+        overlay.add_overlay(controls)
+
         self.prev_btn = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Previous page")
         self.next_btn = Gtk.Button(icon_name="go-next-symbolic", tooltip_text="Next page")
         self.prev_btn.connect("clicked", lambda *_: self._show_page(self.result_index - 1))
@@ -1586,22 +1715,105 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         )
         self.regen_btn.connect("clicked", self._on_regenerate)
 
-        nav = Gtk.Box(spacing=8, margin_bottom=10, margin_start=12, margin_end=12, halign=Gtk.Align.CENTER)
+        nav = Gtk.Box(spacing=8, margin_top=6, margin_bottom=10, margin_start=12, margin_end=12, halign=Gtk.Align.CENTER)
         nav.append(self.prev_btn)
         nav.append(self.page_label)
         nav.append(self.next_btn)
         nav.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL, margin_start=6, margin_end=6))
         nav.append(self.regen_btn)
 
-        # Light backdrop so ink stays visible on transparent exports in dark mode.
-        paper = Gtk.Box(vexpand=True, hexpand=True)
-        paper.add_css_class("result-paper")
-        paper.append(self.picture)
-
         pages = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        pages.append(paper)
+        pages.append(overlay)
         pages.append(nav)
+        self._update_zoom_ui()
         return pages
+
+    # ---- zoom ------------------------------------------------------------ #
+    def _fit_size(self):
+        """(width, height) in px of the page when it exactly fits the viewer, or None if unknown."""
+        paintable = self.picture.get_paintable()
+        ratio = paintable.get_intrinsic_aspect_ratio() if paintable else 0
+        avail_w = self.page_scroller.get_width() - self.picture.get_margin_start() - self.picture.get_margin_end()
+        avail_h = self.page_scroller.get_height() - self.picture.get_margin_top() - self.picture.get_margin_bottom()
+        if ratio <= 0 or avail_w <= 0 or avail_h <= 0:
+            return None
+        width = min(avail_w, avail_h * ratio)
+        return width, width / ratio
+
+    def _apply_zoom_size(self):
+        fit = self._fit_size()
+        if self.zoom <= 1.0 or fit is None:
+            self.picture.set_size_request(-1, -1)  # fit: follow the window
+        else:
+            self.picture.set_size_request(round(fit[0] * self.zoom), round(fit[1] * self.zoom))
+
+    def _set_zoom(self, zoom, anchor=None):
+        """Zoom to `zoom` (1.0 = fit), keeping the page point under `anchor` (x, y in the viewer; default: its center) still."""
+        zoom = max(1.0, min(self.ZOOM_MAX, zoom))
+        if abs(zoom - self.zoom) < 0.001:
+            return
+        hadj, vadj = self.page_scroller.get_hadjustment(), self.page_scroller.get_vadjustment()
+        ax, ay = anchor if anchor else (hadj.get_page_size() / 2, vadj.get_page_size() / 2)
+        self._zoom_pending = {
+            "h": ((hadj.get_value() + ax) / max(hadj.get_upper(), 1.0), ax),
+            "v": ((vadj.get_value() + ay) / max(vadj.get_upper(), 1.0), ay),
+        }
+        GLib.timeout_add(250, self._zoom_pending.clear)  # never leave a stale anchor behind
+        self.zoom = zoom
+        self._apply_zoom_size()
+        self._update_zoom_ui()
+
+    def _zoom_step(self, direction, anchor=None):
+        if self.canvas_stack.get_visible_child_name() != "pages":
+            return
+        if direction > 0:
+            target = next((z for z in self.ZOOM_STEPS if z > self.zoom + 0.001), self.ZOOM_MAX)
+        else:
+            target = next((z for z in reversed(self.ZOOM_STEPS) if z < self.zoom - 0.001), 1.0)
+        self._set_zoom(target, anchor)
+
+    def _update_zoom_ui(self):
+        self.zoom_fit_btn.set_label(f"{round(self.zoom * 100)}%")
+        self.zoom_out_btn.set_sensitive(self.zoom > 1.0 + 0.001)
+        self.zoom_in_btn.set_sensitive(self.zoom < self.ZOOM_MAX - 0.001)
+        self.page_scroller.set_cursor_from_name("grab" if self.zoom > 1.0 else None)
+
+    def _on_zoom_extent_changed(self, adjustment, _pspec):
+        """The page got bigger or smaller: put the anchored point back under the pointer."""
+        axis = "h" if adjustment is self.page_scroller.get_hadjustment() else "v"
+        pending = self._zoom_pending.pop(axis, None)
+        if pending:
+            fraction, anchor = pending
+            adjustment.set_value(fraction * adjustment.get_upper() - anchor)
+
+    def _on_viewer_resized(self, *_):
+        if self.zoom > 1.0:
+            self._apply_zoom_size()
+
+    def _on_zoom_scroll(self, controller, _dx, dy):
+        if not controller.get_current_event_state() & Gdk.ModifierType.CONTROL_MASK:
+            return False  # plain scrolling
+        if self.canvas_stack.get_visible_child_name() != "pages":
+            return False
+        self._set_zoom(self.zoom * 1.1 ** -dy, self._pointer)  # down = out, up = in
+        return True
+
+    def _on_pinch(self, gesture, scale):
+        ok, x, y = gesture.get_bounding_box_center()
+        self._set_zoom(self._pinch_start * scale, (x, y) if ok else None)
+
+    def _on_pan_begin(self, *_):
+        self._pan_start = (self.page_scroller.get_hadjustment().get_value(),
+                           self.page_scroller.get_vadjustment().get_value())
+
+    def _on_pan_update(self, _gesture, dx, dy):
+        if self._pan_start and self.zoom > 1.0:
+            self.page_scroller.get_hadjustment().set_value(self._pan_start[0] - dx)
+            self.page_scroller.get_vadjustment().set_value(self._pan_start[1] - dy)
+
+    def _on_page_clicked(self, _gesture, n_press, x, y):
+        if n_press == 2:  # double-click: zoom in on that spot, or back out to fit
+            self._set_zoom(1.0 if self.zoom > 1.0 else 2.0, (x, y))
 
     def _build_shell(self):
         self.split = Adw.OverlaySplitView(
@@ -1623,6 +1835,10 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         for name, handler in (
             ("generate", self._on_generate),
             ("export", self._on_export),
+            ("print", self._on_print),
+            ("zoom-in", lambda *_: self._zoom_step(1)),
+            ("zoom-out", lambda *_: self._zoom_step(-1)),
+            ("zoom-fit", lambda *_: self._set_zoom(1.0)),
             ("open-text", self._on_open_text),
             ("toggle-sidebar", lambda *_: self.split.set_show_sidebar(not self.split.get_show_sidebar())),
             ("profile-new", self._on_profile_new),
@@ -1670,20 +1886,44 @@ class TypeScribeWindow(Adw.ApplicationWindow):
     def _set_reference(self, path):
         """Show `path` behind the layout preview (None removes it); False if it can't be read."""
         surface = None
+        size = None
         if path:
             try:
-                surface = load_reference_surface(path)
+                surface, size = load_reference(path)
             except (GLib.Error, OSError, ValueError, cairo.Error):
                 return False  # keep whatever was showing
         self.reference_path = path if surface else None
+        self.reference_size = size if surface else None
         self.reference_row.set_subtitle(GLib.markup_escape_text(Path(path).name) if surface else "None chosen")
         self.reference_row.set_tooltip_text(self.reference_path)
-        for widget in (self.reference_clear_btn, self.reference_fit_row, self.reference_opacity_row):
+        for widget in (self.reference_clear_btn, self.reference_fit_row,
+                       self.reference_size_row, self.reference_opacity_row):
             widget.set_visible(surface is not None)
         if hasattr(self, "preview"):
             self.preview.set_reference(surface)
+        self._sync_reference_rows()
         self._queue_save()
         return True
+
+    def _sync_reference_rows(self, *_):
+        """Width and height only show while the reference Size is "Custom size"."""
+        custom = self.reference_size_row.get_visible() and self.reference_size_row.get_selected() == 1
+        for key in ("reference_width", "reference_height"):
+            self.spins[key].set_visible(custom)
+
+    def _on_reference_size_changed(self, *_):
+        if self._updating:
+            return
+        if self.reference_size_row.get_selected() == 1:
+            # Start from the page as it is now (the image covers it); from here on the
+            # image keeps its own size, whatever happens to the page.
+            self._updating = True
+            try:
+                self.spins["reference_width"].set_value(self.spins["view_width"].get_value())
+                self.spins["reference_height"].set_value(self.spins["view_height"].get_value())
+            finally:
+                self._updating = False
+        self._refresh()
 
     def values(self):
         s = self.spins
@@ -1706,6 +1946,9 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             # Layout-preview aid: read only by the preview, never put into a job or export.
             "reference_opacity": s["reference_opacity"].get_value() / 100,
             "reference_fit": self.reference_fit_row.get_selected(),
+            "reference_custom": self.reference_size_row.get_selected() == 1,
+            "reference_width": s["reference_width"].get_value(),
+            "reference_height": s["reference_height"].get_value(),
             # An export option (set in the Export dialog); the layout preview mirrors it.
             "background": self.export_opts["background"] or not CAN_STRIP_BACKGROUND,
         }
@@ -1794,7 +2037,9 @@ class TypeScribeWindow(Adw.ApplicationWindow):
 
     def _on_dims_edited(self, *_):
         """Typing a page size by hand switches the paper to Custom."""
-        if self._updating or self._is_custom_paper():
+        if self._updating:
+            return
+        if self._is_custom_paper():
             return
         self._updating = True
         self.paper_row.set_selected(len(PAPER_NAMES) - 1)
@@ -1810,7 +2055,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         # Keep the physical layout identical: rescale every px value.
         factor = new / self._ppi
         self._updating = True
-        for key in DIM_KEYS:
+        for key in DIM_KEYS + REFERENCE_DIM_KEYS:
             spin = self.spins[key]
             spin.set_value(round(spin.get_value() * factor, spin.get_digits()))
         self._ppi = new
@@ -1847,7 +2092,7 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         ppi = self.current_ppi()
         mm = lambda key: self.spins[key].get_value() / ppi * 25.4  # noqa: E731
         self.paper_row.set_subtitle(f"{mm('view_width'):.0f} × {mm('view_height'):.0f} mm")
-        for key in DIM_KEYS:  # every px value also shows its size in inches
+        for key in DIM_KEYS + REFERENCE_DIM_KEYS:  # every px value also shows its size in inches
             px = self.spins[key].get_value()
             self.spins[key].set_subtitle(f"px  ({px / ppi:.2f} in)")
         self._update_actions()
@@ -1864,12 +2109,18 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         v, text = self.values(), self.get_text()
         self._set_action_enabled("generate", running or self._can_generate(v, text))
         self._set_action_enabled("export", bool(self.result_pages) and not running)
+        self._set_action_enabled("print", bool(self.result_pages) and not running)
+        for name in ("zoom-in", "zoom-out", "zoom-fit"):
+            self._set_action_enabled(name, bool(self.result_pages))
         self._set_action_enabled("open-text", not running)
         self.generate_btn.set_tooltip_text(
             "Stop writing" if running else "Write the text by hand (Ctrl+Enter)"
         )
         self.export_btn.set_tooltip_text(
             "Save the generated pages (Ctrl+E)" if self.result_pages else "Generate pages first"
+        )
+        self.print_btn.set_tooltip_text(
+            "Print the generated pages (Ctrl+P)" if self.result_pages else "Generate pages first"
         )
         self.regen_btn.set_sensitive(bool(self.result_pages) and self.last_job is not None and not running)
 
@@ -1930,8 +2181,13 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.result_index = index
         svg = self.result_pages[index]
         preview = svg + ".png" if os.path.exists(svg + ".png") else svg
-        self.picture.set_file(None)  # drop the cached image so a rewritten page reloads
-        self.picture.set_file(Gio.File.new_for_path(preview))
+        try:  # read fresh from disk (a rewritten page reloads); its size is known straight away
+            self.picture.set_paintable(Gdk.Texture.new_from_filename(preview))
+        except GLib.Error:
+            self.picture.set_file(None)
+            self.picture.set_file(Gio.File.new_for_path(preview))
+        self._apply_zoom_size()
+        self.page_scroller.get_vadjustment().set_value(0)  # a new page starts at its top
         self.page_label.set_text(f"Page {index + 1} of {len(self.result_pages)}")
         self.prev_btn.set_sensitive(index > 0)
         self.next_btn.set_sensitive(index < len(self.result_pages) - 1)
@@ -2192,6 +2448,63 @@ class TypeScribeWindow(Adw.ApplicationWindow):
         self.export_opts["name_auto"] = not typed or typed == derive_base_name(self.get_text())
         self._queue_save()
 
+    def _build_print_operation(self):
+        """A print job for the pages shown now, one sheet per page, sized like the page."""
+        pages = list(self.result_pages)  # what is on screen, even if it is regenerated meanwhile
+        include_background = self.export_opts["background"] or not CAN_STRIP_BACKGROUND
+        size = None
+        if pages:
+            try:
+                size = svg_text_size(Path(pages[0]).read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                size = None
+
+        op = Gtk.PrintOperation()
+        op.set_unit(Gtk.Unit.POINTS)  # drawing coordinates are points, as in the page's SVG
+        op.set_n_pages(len(pages))
+        op.set_job_name(self.export_opts.get("name") or "TypeScribe")
+        op.set_embed_page_setup(True)
+        if size:  # open the dialog on a sheet the size of the page; any other can be picked there
+            setup = Gtk.PageSetup()
+            setup.set_paper_size(Gtk.PaperSize.new_custom("typescribe", "TypeScribe page", size[0], size[1], Gtk.Unit.POINTS))
+            op.set_default_page_setup(setup)
+
+        def on_draw_page(_op, context, number):
+            try:
+                draw_page_fitted(
+                    context.get_cairo_context(), pages[number],
+                    context.get_width(), context.get_height(), include_background,
+                )
+            except (OSError, RuntimeError, ValueError, GLib.Error, cairo.Error) as error:
+                self._print_error = str(error)
+                _op.cancel()
+
+        def on_done(_op, result):
+            self._print_op = None
+            if result == Gtk.PrintOperationResult.ERROR:
+                self.toast(f"Could not print: {_op.get_error().message}")
+            elif getattr(self, "_print_error", None):
+                self.toast(f"Could not print: {self._print_error}")
+            elif result == Gtk.PrintOperationResult.APPLY:
+                count = len(pages)
+                self.toast(f"Sent {count} page{'s' if count != 1 else ''} to print")
+            self._print_error = None
+
+        op.connect("draw-page", on_draw_page)
+        op.connect("done", on_done)
+        return op
+
+    def _on_print(self, *_):
+        if not self.result_pages or self.run:
+            return
+        self._print_error = None
+        self._print_op = self._build_print_operation()  # keep it alive while the dialog is open
+        try:
+            self._print_op.run(Gtk.PrintOperationAction.PRINT_DIALOG, self)
+        except GLib.Error as error:
+            self._print_op = None
+            self.toast(f"Could not print: {error.message}")
+
     def _on_export(self, *_):
         if not self.result_pages or self.run:
             return
@@ -2403,10 +2716,18 @@ class TypeScribeWindow(Adw.ApplicationWindow):
     def _sync_profile_row(self):
         names = list(self.profiles)
         index = names.index(self.active_profile) if self.active_profile in names else 0
+        model = self.profile_row.get_model()
+        shown = [model.get_string(i) for i in range(model.get_n_items())] if model else []
         self._updating = True
-        self.profile_row.set_model(Gtk.StringList.new(names))
-        self.profile_row.set_selected(index)
-        self._updating = False
+        try:
+            # Rebuilding the model while the row is still announcing its own selection change
+            # frees objects it is using (a crash), so only touch what actually changed.
+            if shown != names:
+                self.profile_row.set_model(Gtk.StringList.new(names))
+            if self.profile_row.get_selected() != index:
+                self.profile_row.set_selected(index)
+        finally:
+            self._updating = False
         self.window_title.set_subtitle(self.active_profile)
         self.profile_avatar.set_text(self.active_profile)
         self._set_action_enabled("profile-delete", len(self.profiles) > 1)
@@ -2582,7 +2903,11 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             "paper": self.paper_row.get_selected(),
             "orientation": self.orientation_row.get_selected(),
             "ppi": self.ppi_row.get_selected(),
-            "reference": {"path": self.reference_path, "fit": self.reference_fit_row.get_selected()},
+            "reference": {
+                "path": self.reference_path,
+                "fit": self.reference_fit_row.get_selected(),
+                "size": self.reference_size_row.get_selected(),
+            },
             "formats": {
                 "format": self.export_opts["format"], "pdf": self.export_opts["pdf"],
                 "page_background": self.export_opts["background"],
@@ -2608,9 +2933,13 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             self.spins["lines_per_page"].set_range(1, 200)
             self.spins["start_line"].set_range(0, 199)
             self.spins["start_line"].set_value(0)  # profiles saved before this setting existed
-            for key, value in (data.get("spins") or {}).items():
+            saved_spins = data.get("spins") or {}
+            for key, value in saved_spins.items():
                 if key in self.spins and number(value):
                     self.spins[key].set_value(value)
+            for key, page_key in (("reference_width", "view_width"), ("reference_height", "view_height")):
+                if key not in saved_spins:  # older profile: keep the page size it already had
+                    self.spins[key].set_value(self.spins[page_key].get_value())
             for key, value in (data.get("colors") or {}).items():
                 rgba = Gdk.RGBA()
                 if key in self.colors and isinstance(value, str) and rgba.parse(value):
@@ -2624,6 +2953,8 @@ class TypeScribeWindow(Adw.ApplicationWindow):
             ref = data.get("reference") if isinstance(data.get("reference"), dict) else {}
             fit = ref.get("fit")
             select(self.reference_fit_row, fit if isinstance(fit, int) else 0)
+            size = ref.get("size")
+            select(self.reference_size_row, size if isinstance(size, int) else 0)
             path = ref.get("path")
             if not (isinstance(path, str) and Path(path).is_file() and self._set_reference(path)):
                 self._set_reference(None)  # none saved, or the file has gone away
@@ -2732,6 +3063,10 @@ class TypeScribeApp(Adw.Application):
         self.set_accels_for_action("win.generate", ["<Primary>Return"])
         self.set_accels_for_action("win.open-text", ["<Primary>o"])
         self.set_accels_for_action("win.export", ["<Primary>e"])
+        self.set_accels_for_action("win.print", ["<Primary>p"])
+        self.set_accels_for_action("win.zoom-in", ["<Primary>plus", "<Primary>equal", "<Primary>KP_Add"])
+        self.set_accels_for_action("win.zoom-out", ["<Primary>minus", "<Primary>KP_Subtract"])
+        self.set_accels_for_action("win.zoom-fit", ["<Primary>0", "<Primary>KP_0"])
         self.set_accels_for_action("win.toggle-sidebar", ["F9"])
 
     def do_activate(self):

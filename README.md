@@ -63,6 +63,10 @@ There are two ways to get things rolling:
    export menu. Use **Export As** (`Ctrl+Shift+E`) to choose a destination;
    TypeScribe remembers that folder for later. `Ctrl+E` exports to the remembered
    folder.
+7. To print the generated pages, choose **Print…** in the main menu (`Ctrl+P`).
+   It uses the system print dialog, so "Print to File" works too. Whether the
+   paper color and ruled lines are printed follows the page background setting in
+   the Export dialog.
 
 ### Known Issues
 - Antivirus programs may flag (and even delete) the executable. This is due to the way Python programs are built and handled by Windows and cannot possibly be fixed. However, there is no cause for concern.
